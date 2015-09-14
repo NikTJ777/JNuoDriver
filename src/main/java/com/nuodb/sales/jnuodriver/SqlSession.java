@@ -1,15 +1,14 @@
-package com.nuodb.sales.jnuotest.dao;
+package com.nuodb.sales.jnuodriver;
 
 
 import com.nuodb.jdbc.TransactionIsolation;
-import com.nuodb.sales.jnuotest.Controller;
+import com.nuodb.sales.jnuodriver.dao.PersistenceException;
 
 import javax.sql.DataSource;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
-import java.util.regex.Pattern;
 
 /**
  * Created by nik on 7/5/15.

@@ -1,4 +1,4 @@
-package com.nuodb.sales.jnuotest;
+package com.nuodb.sales.jnuodriver;
 
 public class Main {
 

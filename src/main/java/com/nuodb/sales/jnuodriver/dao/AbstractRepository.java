@@ -1,7 +1,8 @@
-package com.nuodb.sales.jnuotest.dao;
+package com.nuodb.sales.jnuodriver.dao;
 
 
-import javax.sql.DataSource;
+import com.nuodb.sales.jnuodriver.SqlSession;
+
 import java.sql.*;
 import java.util.*;
 import java.util.Date;

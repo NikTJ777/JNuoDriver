@@ -1,4 +1,4 @@
-package com.nuodb.sales.jnuotest.dao;
+package com.nuodb.sales.jnuodriver.dao;
 
 /**
  * Created by nik on 7/15/15.

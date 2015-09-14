@@ -4,13 +4,14 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.nuodb.sales</groupId>
-    <artifactId>JNuoTest</artifactId>
-    <version>1.0-nuodb-2_3_1_6-SNAPSHOT</version>
-
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+	<nuodb.jdbc.version>2.3.1</nuodb.jdbc.version>
     </properties>
+
+    <groupId>com.nuodb.sales</groupId>
+    <artifactId>JNuoDriver</artifactId>
+    <version>1.0-nuodb-${nuodb.jdbc.version}-SNAPSHOT</version>
 
     <build>
         <plugins>
@@ -29,7 +30,7 @@
               <configuration>
                 <archive>
                   <manifest>
-                    <mainClass>com.nuodb.sales.jnuotest.Main</mainClass>
+                    <mainClass>com.nuodb.sales.jnuodbdriver.Main</mainClass>
                   </manifest>
                 </archive>
                 <descriptorRefs>
@@ -45,8 +46,7 @@
         <dependency>
             <groupId>com.nuodb.jdbc</groupId>
             <artifactId>nuodb-jdbc</artifactId>
-<!--            <version>2.2.0</version>  -->
-  	    <version>2.3.1</version>
+  	    <version>${nuodb.jdbc.version}</version>
         </dependency>
 
         <dependency>

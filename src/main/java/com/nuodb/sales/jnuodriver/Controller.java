@@ -1,9 +1,8 @@
-package com.nuodb.sales.jnuotest;
+package com.nuodb.sales.jnuodriver;
 
-import com.nuodb.sales.jnuotest.dao.PersistenceException;
-import com.nuodb.sales.jnuotest.dao.SqlSession;
-import com.nuodb.sales.jnuotest.domain.*;
-import com.nuodb.sales.jnuotest.domain.Event;
+import com.nuodb.sales.jnuodriver.dao.PersistenceException;
+import com.nuodb.sales.jnuodriver.service.GenericService;
+import com.nuodb.sales.jnuodriver.service.Service;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -21,14 +20,8 @@ import java.util.regex.Pattern;
  */
 public class Controller implements AutoCloseable {
 
-    OwnerRepository ownerRepository;
-    EventRepository eventRepository;
-    GroupRepository groupRepository;
-    DataRepository dataRepository;
-
-    ExecutorService insertExecutor;
-    ScheduledExecutorService queryExecutor;
-
+    ScheduledExecutorService taskExecutor;
+    Service service;
 
     Properties fileProperties;
     Properties appProperties;
@@ -46,9 +39,6 @@ public class Controller implements AutoCloseable {
 
     TxModel txModel;
     SqlSession.Mode bulkCommitMode;
-
-    //volatile long totalInserts = 0;
-    //volatile long totalInsertTime = 0;
 
     AtomicLong totalInserts = new AtomicLong();
     AtomicLong totalInsertTime = new AtomicLong();
@@ -208,6 +198,8 @@ public class Controller implements AutoCloseable {
         threadParam = appProperties.getProperty(QUERY_THREADS);
         int queryThreads = (threadParam != null ? Integer.parseInt(threadParam) : 1);
 
+        int totalThreads = insertThreads + queryThreads;
+
         if (maxViewAfterInsert > 0 && maxViewAfterInsert < minViewAfterInsert) {
             maxViewAfterInsert = minViewAfterInsert;
         }
@@ -230,7 +222,7 @@ public class Controller implements AutoCloseable {
 
         //String insertIsolation = appProperties.getProperty(UPDATE_ISOLATION);
         //DataSource dataSource = new com.nuodb.jdbc.DataSource(dbProperties);
-        SqlSession.init(dbProperties, insertThreads + queryThreads);
+        SqlSession.init(dbProperties, totalThreads);
 
         SqlSession.CommunicationMode commsMode;
         try { commsMode = Enum.valueOf(SqlSession.CommunicationMode.class, appProperties.getProperty(COMMUNICATION_MODE));}
@@ -241,17 +233,7 @@ public class Controller implements AutoCloseable {
 
         SqlSession.setSpNamePrefix(appProperties.getProperty(SP_NAME_PREFIX));
 
-        ownerRepository = new OwnerRepository();
-        ownerRepository.init();
-
-        groupRepository = new GroupRepository();
-        groupRepository.init();
-
-        dataRepository = new DataRepository();
-        dataRepository.init();
-
-        eventRepository = new EventRepository(ownerRepository, groupRepository, dataRepository);
-        eventRepository.init();
+        service = new GenericService();
 
         try { txModel = Enum.valueOf(TxModel.class, appProperties.getProperty(TX_MODEL)); }
         catch (Exception e) { txModel = TxModel.DISCRETE; }
@@ -259,8 +241,7 @@ public class Controller implements AutoCloseable {
         try { bulkCommitMode = Enum.valueOf(SqlSession.Mode.class, appProperties.getProperty(BULK_COMMIT_MODE)); }
         catch (Exception e) { bulkCommitMode = SqlSession.Mode.BATCH; }
 
-        insertExecutor = Executors.newFixedThreadPool(insertThreads);
-        queryExecutor= Executors.newScheduledThreadPool(queryThreads);
+        taskExecutor = Executors.newScheduledThreadPool(totalThreads);
 
         if ("true".equalsIgnoreCase(appProperties.getProperty("check.config"))) {
             System.out.println("CheckConfig called - nothing to do; exiting.");
@@ -277,7 +258,7 @@ public class Controller implements AutoCloseable {
             unique = 1;
         } else {
             try (SqlSession session = new SqlSession(SqlSession.Mode.AUTO_COMMIT)) {
-                String lastEventId = eventRepository.getValue("id", "ORDER BY id DESC LIMIT 1");
+                String lastEventId = service.getSequence("");
                 unique = Long.parseLong(lastEventId) + 1;
                 appLog.info(String.format("lastEventID = %s", lastEventId));
             }
@@ -405,11 +386,8 @@ public class Controller implements AutoCloseable {
     public void close()
     {
         try {
-            insertExecutor.shutdownNow();
-            insertExecutor.awaitTermination(10, TimeUnit.SECONDS);
-
-            queryExecutor.shutdownNow();
-            queryExecutor.awaitTermination(10, TimeUnit.SECONDS);
+            taskExecutor.shutdownNow();
+            taskExecutor.awaitTermination(10, TimeUnit.SECONDS);
         }
         catch (InterruptedException e) {
             System.out.println("Interrupted while waiting for shutdown - exiting");
@@ -520,7 +498,7 @@ public class Controller implements AutoCloseable {
         // implement warp-drive...
         if (timingSpeedup > 1) delay /= timingSpeedup;
 
-        queryExecutor.schedule(new EventViewTask(eventId), (long) delay, TimeUnit.SECONDS);
+        taskExecutor.schedule(new EventViewTask(eventId), (long) delay, TimeUnit.SECONDS);
 
         appLog.info(String.format("Scheduled EventViewTask for now +%d", delay));
     }
