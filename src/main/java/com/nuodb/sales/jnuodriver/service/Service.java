@@ -5,7 +5,6 @@ package com.nuodb.sales.jnuodriver.service;
  */
 public interface Service {
 
-    public long getSequence();
-
+    public long getUnique();
 
 }

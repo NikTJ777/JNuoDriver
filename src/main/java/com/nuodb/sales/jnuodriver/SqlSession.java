@@ -239,68 +239,20 @@ public class SqlSession implements AutoCloseable {
         return ps;
     }
 
-    public void execute(String script) {
-        if (script == null || script.length() == 0) return;
+    public void execute(String[] script) {
+        if (script == null || script.length == 0) return;
 
-        String[] lines = script.split(";");
-        StringBuilder statement = new StringBuilder(2048);
-
+        String statement = "";
         try (Statement sql = connection().createStatement()) {
             assert sql != null;
-            boolean multiLine = false;
-            for (String line : lines) {
 
-                line = line.trim();
-                //System.out.println("line=" + line);
-
-                if (line.startsWith("//")) {
-                    continue;
-                }
-
-                // skip "GO" commands
-                if (line.equalsIgnoreCase("GO")) {
-                    multiLine = false;
-                    line = "";
-                }
-
-                // assemble multi-statement commands
-                else if (line.toUpperCase().startsWith("CREATE PROCEDURE"))
-                    multiLine = true;
-
-                else if (line.equalsIgnoreCase("END_PROCEDURE"))
-                    multiLine = false;
-
-                if (line != null && line.length() > 0) {
-                    if (statement.length() > 0) {
-                        statement.append("; ");
-                    }
-
-                    statement.append(line);
-                }
-
-                //log.info("multiLine? " + multiLine);
-                if (multiLine)
-                    continue;
-
-                log.info(String.format("executing statement %s", statement.toString()));
-                sql.execute(statement.toString());
-                statement.setLength(0);
+            for (String line : script) {
+                statement = line;
+                log.info(String.format("executing statement %s", statement));
+                sql.execute(statement);
             }
 
-            /*
-            String command = "";
-            try (Statement sql = connection().createStatement()) {
-                assert sql != null;
-
-            for (String line : lines) {
-                command = line.trim();
-                if (command.charAt(0) == '#') continue; // ignore comment lines
-
-                System.out.println(String.format("executing statement %s", command));
-                sql.execute(command);
-            }
-            */
-            System.out.println("commiting...");
+            System.out.println("committing...");
             connection().commit();
         } catch (SQLException e) {
             throw new PersistenceException(e, "Error executing SQL: %s", statement);

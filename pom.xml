@@ -30,7 +30,7 @@
               <configuration>
                 <archive>
                   <manifest>
-                    <mainClass>com.nuodb.sales.jnuodbdriver.Main</mainClass>
+                    <mainClass>com.nuodb.sales.jnuodriver.Main</mainClass>
                   </manifest>
                 </archive>
                 <descriptorRefs>

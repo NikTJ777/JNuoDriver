@@ -1,7 +1,6 @@
 package com.nuodb.sales.jnuodriver;
 
-import com.nuodb.sales.jnuodriver.dao.PersistenceException;
-import com.nuodb.sales.jnuodriver.service.GenericService;
+import com.nuodb.sales.jnuodriver.dao.ConfigurationException;
 import com.nuodb.sales.jnuodriver.service.Service;
 
 import java.io.IOException;
@@ -20,25 +19,19 @@ import java.util.regex.Pattern;
  */
 public class Controller implements AutoCloseable {
 
+    ArrayList<TaskContext> taskList;
     ScheduledExecutorService taskExecutor;
+    ValueGenerator valueGenerator;
     Service service;
 
     Properties fileProperties;
     Properties appProperties;
 
     long runTime;
-    float averageRate, timingSpeedup;
-    int minViewAfterInsert, maxViewAfterInsert;
-    int minGroups, maxGroups;
-    int minData, maxData;
-    float burstProbability;
-    int minBurst, maxBurst;
-    int maxQueued, queryBackoff;
+    float timingSpeedup;
+    int maxQueued, queryBackoff, updateThreads, queryThreads;
     boolean initDb = false;
     boolean queryOnly = false;
-
-    TxModel txModel;
-    SqlSession.Mode bulkCommitMode;
 
     AtomicLong totalInserts = new AtomicLong();
     AtomicLong totalInsertTime = new AtomicLong();
@@ -56,25 +49,37 @@ public class Controller implements AutoCloseable {
 
     private static final Properties defaultProperties = new Properties();
 
+    public static final String TASK_NAME =          "task.name";
     public static final String PROPERTIES_PATH =    "properties.path";
+    public static final String DB_PROPERTIES_PATH = "db.properties.path";
+    public static final String TASK_PROPERTIES_PATHS = "task.properties.paths";
+    public static final String UPDATE_TASK_CLASS =  "update.task.class";
+    public static final String QUERY_TASK_CLASS =   "query.task.class";
     public static final String AVERAGE_RATE =       "timing.rate";
+    public static final String MAX_RETRY =          "max.retry";
+    public static final String RATE_SMOOTHING =     "rate.smoothing";
     public static final String MIN_VIEW_DELAY =     "timing.min.view.delay";
     public static final String MAX_VIEW_DELAY =     "timing.max.view.delay";
     public static final String TIMING_SPEEDUP =     "timing.speedup";
-    public static final String INSERT_THREADS =     "insert.threads";
+    public static final String UPDATE_THREADS =     "update.threads";
     public static final String QUERY_THREADS =      "query.threads";
     public static final String MAX_QUEUED =         "max.queued";
-    public static final String DB_PROPERTIES_PATH = "db.properties.path";
     public static final String RUN_TIME =           "run.time";
-    public static final String MIN_GROUPS =         "min.groups";
-    public static final String MAX_GROUPS =         "max.groups";
-    public static final String MIN_DATA =           "min.data";
-    public static final String MAX_DATA =           "max.data";
+    public static final String MIN_FANOUT =         "min.fanout";
+    public static final String MAX_FANOUT =         "max.fanout";
+    public static final String MIN_LEAVES =         "min.leaves";
+    public static final String MAX_LEAVES =         "max.leaves";
     public static final String BURST_PROBABILITY_PERCENT = "burst.probability.percent";
     public static final String MIN_BURST =          "min.burst";
     public static final String MAX_BURST =          "max.burst";
     public static final String DB_INIT =            "db.init";
+    public static final String DB_INSTRUMENT_SQL =  "db.instrument.sql";
     public static final String DB_INIT_SQL =        "db.init.sql";
+    public static final String DB_UPDATE_SQL =      "db.update.sql";
+    public static final String DB_UPDATE_VALUES =   "db.update.values";
+    public static final String DB_QUERY_SQL =       "db.query.sql";
+    public static final String DB_QUERY_VALUES =    "db.query.values";
+    public static final String DB_CATCH_BLOCK =     "db.catch.block";
     public static final String DB_SCHEMA =          "db.schema";
     public static final String TX_MODEL =           "tx.model";
     public static final String COMMUNICATION_MODE = "communication.mode";
@@ -88,6 +93,8 @@ public class Controller implements AutoCloseable {
     public static final String LIST_PREFIX =        "@list";
 
     protected enum TxModel { DISCRETE, UNIFIED }
+
+    public enum TaskType { UPDATE, QUERY }
 
     private static Logger appLog = Logger.getLogger("JNuoTest");
     private static Logger insertLog = Logger.getLogger("InsertLog");
@@ -104,26 +111,31 @@ public class Controller implements AutoCloseable {
     public Controller() {
         defaultProperties.setProperty(PROPERTIES_PATH, "classpath://properties/Application.properties");
         defaultProperties.setProperty(DB_PROPERTIES_PATH, "classpath://properties/Database.properties");
+        defaultProperties.setProperty(UPDATE_TASK_CLASS, GenericTask.class.getName());
+        defaultProperties.setProperty(QUERY_TASK_CLASS, GenericTask.class.getName());
         defaultProperties.setProperty(AVERAGE_RATE, "0");
         defaultProperties.setProperty(MIN_VIEW_DELAY, "0");
         defaultProperties.setProperty(MAX_VIEW_DELAY, "0");
         defaultProperties.setProperty(TIMING_SPEEDUP, "1");
-        defaultProperties.setProperty(INSERT_THREADS, "1");
+        defaultProperties.setProperty(RATE_SMOOTHING, "10");
+        defaultProperties.setProperty(UPDATE_THREADS, "1");
         defaultProperties.setProperty(QUERY_THREADS, "1");
         defaultProperties.setProperty(MAX_QUEUED, "0");
-        defaultProperties.setProperty(MIN_GROUPS, "1");
-        defaultProperties.setProperty(MAX_GROUPS, "5");
-        defaultProperties.setProperty(MIN_DATA, "500");
-        defaultProperties.setProperty(MAX_DATA, "3500");
+        defaultProperties.setProperty(MIN_FANOUT, "1");
+        defaultProperties.setProperty(MAX_FANOUT, "5");
+        defaultProperties.setProperty(MIN_LEAVES, "500");
+        defaultProperties.setProperty(MAX_LEAVES, "3500");
         defaultProperties.setProperty(BURST_PROBABILITY_PERCENT, "0");
         defaultProperties.setProperty(MIN_BURST, "0");
         defaultProperties.setProperty(MAX_BURST, "0");
+        defaultProperties.setProperty(MAX_RETRY, "3");
         defaultProperties.setProperty(RUN_TIME, "5");
         defaultProperties.setProperty(TX_MODEL, "DISCRETE");
         defaultProperties.setProperty(COMMUNICATION_MODE, "SQL");
         defaultProperties.setProperty(BULK_COMMIT_MODE, "BATCH");
         defaultProperties.setProperty(SP_NAME_PREFIX, "importer_");
         defaultProperties.setProperty(DB_INIT, "false");
+        defaultProperties.setProperty(DB_INSTRUMENT_SQL, "true");
         defaultProperties.setProperty(QUERY_ONLY, "false");
         defaultProperties.setProperty(QUERY_BACKOFF, "0");
         defaultProperties.setProperty(UPDATE_ISOLATION, "CONSISTENT_READ");
@@ -157,14 +169,12 @@ public class Controller implements AutoCloseable {
         }
 
         // load properties from application.properties file into first (lower-priority) level of fileProperties
-        loadProperties(prop, PROPERTIES_PATH);
+        loadProperties(prop, appProperties.getProperty(PROPERTIES_PATH));
 
         // now load database properties into second (higher-priority) level of fileProperties
-        loadProperties(fileProperties, DB_PROPERTIES_PATH);
+        loadProperties(fileProperties, appProperties.getProperty(DB_PROPERTIES_PATH));
 
         appLog.info(String.format("appProperties: %s", appProperties));
-
-        //resolveReferences(appProperties);
 
         StringBuilder builder = new StringBuilder(1024);
         builder.append("\n***************** Resolved Properties ********************\n");
@@ -176,38 +186,19 @@ public class Controller implements AutoCloseable {
         appLog.info(builder.toString() + "**********************************************************\n");
 
         runTime = Integer.parseInt(appProperties.getProperty(RUN_TIME)) * Millis;
-        averageRate = Float.parseFloat(appProperties.getProperty(AVERAGE_RATE));
-        minViewAfterInsert = Integer.parseInt(appProperties.getProperty(MIN_VIEW_DELAY));
-        maxViewAfterInsert = Integer.parseInt(appProperties.getProperty(MAX_VIEW_DELAY));
         timingSpeedup = Float.parseFloat(appProperties.getProperty(TIMING_SPEEDUP));
-        minGroups = Integer.parseInt(appProperties.getProperty(MIN_GROUPS));
-        maxGroups = Integer.parseInt(appProperties.getProperty(MAX_GROUPS));
-        minData = Integer.parseInt(appProperties.getProperty(MIN_DATA));
-        maxData = Integer.parseInt(appProperties.getProperty(MAX_DATA));
-        burstProbability = Float.parseFloat(appProperties.getProperty(BURST_PROBABILITY_PERCENT));
-        minBurst = Integer.parseInt(appProperties.getProperty(MIN_BURST));
-        maxBurst = Integer.parseInt(appProperties.getProperty(MAX_BURST));
         maxQueued = Integer.parseInt(appProperties.getProperty(MAX_QUEUED));
         initDb = Boolean.parseBoolean(appProperties.getProperty(DB_INIT));
         queryOnly = Boolean.parseBoolean(appProperties.getProperty(QUERY_ONLY));
         queryBackoff = Integer.parseInt(appProperties.getProperty(QUERY_BACKOFF));
 
-        String threadParam = appProperties.getProperty(INSERT_THREADS);
-        int insertThreads = (threadParam != null ? Integer.parseInt(threadParam) : 1);
+        String threadParam = appProperties.getProperty(UPDATE_THREADS);
+        updateThreads = (threadParam != null ? Integer.parseInt(threadParam) : 1);
 
         threadParam = appProperties.getProperty(QUERY_THREADS);
-        int queryThreads = (threadParam != null ? Integer.parseInt(threadParam) : 1);
+        queryThreads = (threadParam != null ? Integer.parseInt(threadParam) : 1);
 
-        int totalThreads = insertThreads + queryThreads;
-
-        if (maxViewAfterInsert > 0 && maxViewAfterInsert < minViewAfterInsert) {
-            maxViewAfterInsert = minViewAfterInsert;
-        }
-
-        if (maxBurst <= minBurst) {
-            appLog.info(String.format("maxBurst (%d) <= minBurst (%d); burst disabled"));
-            burstProbability = minBurst = maxBurst = 0;
-        }
+        int totalThreads = updateThreads + queryThreads;
 
         // filter out database properties, and strip off the prefix
         Properties dbProperties = new Properties();
@@ -233,17 +224,41 @@ public class Controller implements AutoCloseable {
 
         SqlSession.setSpNamePrefix(appProperties.getProperty(SP_NAME_PREFIX));
 
-        service = new GenericService();
+        String taskPaths = appProperties.getProperty(TASK_PROPERTIES_PATHS);
+        if (taskPaths == null || taskPaths.length() == 0) {
+            System.out.println("No Task properties defined - nothing to do");
+            System.exit(0);
+        }
 
-        try { txModel = Enum.valueOf(TxModel.class, appProperties.getProperty(TX_MODEL)); }
-        catch (Exception e) { txModel = TxModel.DISCRETE; }
+        taskList = new ArrayList<TaskContext>(64);
+        valueGenerator = new ValueGenerator();
 
-        try { bulkCommitMode = Enum.valueOf(SqlSession.Mode.class, appProperties.getProperty(BULK_COMMIT_MODE)); }
-        catch (Exception e) { bulkCommitMode = SqlSession.Mode.BATCH; }
+        String[] tasks = taskPaths.split(",");
+        for (String task : tasks) {
+            Properties taskProperties = new Properties(appProperties);
+            loadProperties(taskProperties, task);
+            TaskContext context = new TaskContext(task, taskProperties);
+            taskList.add(context);
+            valueGenerator.addSource(context);
+        }
+
+        for (TaskContext task : taskList) {
+            builder.append("\n*** ").append(task.path).append(" ***\n");
+            for (Map.Entry<Object, Object> entry : task.properties.entrySet()) {
+                builder.append(String.format("%s = %s\n", entry.getKey().toString(), entry.getValue().toString()));
+            }
+            builder.append("\n********\n");
+        }
+
+        //service = new GenericService();
 
         taskExecutor = Executors.newScheduledThreadPool(totalThreads);
 
         if ("true".equalsIgnoreCase(appProperties.getProperty("check.config"))) {
+            valueGenerator.start();
+            try { Thread.sleep(3000); }
+            catch (InterruptedException e) {}
+
             System.out.println("CheckConfig called - nothing to do; exiting.");
             System.exit(0);
         }
@@ -258,9 +273,8 @@ public class Controller implements AutoCloseable {
             unique = 1;
         } else {
             try (SqlSession session = new SqlSession(SqlSession.Mode.AUTO_COMMIT)) {
-                String lastEventId = service.getSequence("");
-                unique = Long.parseLong(lastEventId) + 1;
-                appLog.info(String.format("lastEventID = %s", lastEventId));
+                unique = service.getUnique() + 1;
+                appLog.info(String.format("lastEventID = %s", unique));
             }
         }
 
@@ -272,14 +286,11 @@ public class Controller implements AutoCloseable {
      * @throws InterruptedException
      */
     public void run()
-        throws InterruptedException
+        throws InterruptedException, Exception
     {
         long start = System.currentTimeMillis();
         long endTime = start + runTime;
         long now;
-
-        double currentRate = 0.0;
-        long averageSleep = (long) (Millis2Seconds / averageRate);
 
         totalEvents = 0;
         wallTime = 0;
@@ -287,89 +298,43 @@ public class Controller implements AutoCloseable {
         double burstRate = 0.0;
         int burstSize = 0;
 
+        long sleepTime;
+
         // ensure that first sample time is different from start time...
         long settleTime = 2 * Millis;
         appLog.info(String.format("Settling for %d: ", settleTime));
         Thread.sleep(settleTime);
 
-        // just run some queries
-        if (queryOnly) {
-
-            appLog.info("Query-Only...");
-
-            long eventId = 1;
-
-            while (System.currentTimeMillis() < endTime) {
-                queryExecutor.schedule(new EventViewTask(eventId++), 2, TimeUnit.MILLISECONDS);
-                totalEvents++;
-
-                appLog.info(String.format("Processed %,d events containing %,d records in %.2f secs"
-                                + "\n\tThroughput:\t%.2f events/sec at %.2f ips;"
-                                + "\n\tSpeed:\t\t%,d inserts in %.2f secs = %.2f ips"
-                                + "\n\tQueries:\t%,d queries got %,d records in %.2f secs at %.2f qps",
-                        totalEvents, totalInserts.get(), (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalInserts.get() / wallTime),
-                        totalInserts.get(), (totalInsertTime.get() / Nano2Seconds), (Nano2Seconds * totalInserts.get() / totalInsertTime.get()),
-                        totalQueries.get(), totalQueryRecords.get(), (totalQueryTime.get() / Nano2Seconds), (Nano2Seconds * totalQueries.get() / totalQueryTime.get())));
-
-                //if (((ThreadPoolExecutor) queryExecutor).getQueue().size() > 10) {
-                if (totalEvents + 10 > totalQueries.get()) {
-                    appLog.info(String.format("%d queries waiting - sleeping", totalEvents - totalQueries.get()));
-                    try {
-                        Thread.sleep((200));
-                    } catch (InterruptedException e) {
-                    }
-                }
-            }
-
-            return;
-        }
-
+        // start the value generator
+        //valueGenerator.start();
 
         do {
-            insertExecutor.execute(new EventGenerator(unique++));
-
             totalEvents++;
-
-            appLog.info(String.format("Event scheduled. Queue size=%d", ((ThreadPoolExecutor) insertExecutor).getQueue().size()));
+            appLog.info(String.format("Scheduling Task. Queue size=%d", ((ThreadPoolExecutor) taskExecutor).getQueue().size()));
 
             now = System.currentTimeMillis();
-            currentRate = (Millis2Seconds * totalEvents) / (now - start);
+            wallTime = now - start;
+            appLog.info(String.format("now=%d; endTime=%d;  elapsed=%d; time left=%d", now, endTime, wallTime, endTime - now));
 
-            appLog.info(String.format("now=%d; endTime=%d;  elapsed=%d; time left=%d", now, endTime, now - start, endTime - now));
-
-            // randomly create a burst
-            if (burstSize == 0 && burstProbability > 0 && Percent * random.nextFloat() <= burstProbability) {
-                burstSize = minBurst + random.nextInt(maxBurst - minBurst);
-                appLog.info(String.format("Creating burst of %d", burstSize));
+            sleepTime = endTime - now;
+            long delay = 0;
+            for (TaskContext task : taskList) {
+                delay = task.schedule();
+                if (delay < sleepTime) sleepTime = delay;
             }
 
-            if (burstSize > 0) {
-                burstSize--;
-            } else {
-                if (averageRate > 0) {
-                    long sleepTime = (long) (averageSleep * (currentRate / averageRate));
-                    if (now + sleepTime > endTime) sleepTime = 1 * Millis;
-
-                    appLog.info(String.format("Current Rate= %.2f; sleeping for %,d ms", currentRate, sleepTime));
-
-                    if (timingSpeedup > 1) {
-                        sleepTime /= timingSpeedup;
-                        appLog.info(String.format("Warp-drive: speedup %f; sleeping for %d ms", timingSpeedup, sleepTime));
-                    }
-
-                    Thread.sleep(sleepTime);
-                }
-
-                while (maxQueued >= 0 && ((ThreadPoolExecutor) insertExecutor).getQueue().size() > maxQueued) {
-                    appLog.info(String.format("Queue size %d is over limit %d - sleeping", ((ThreadPoolExecutor) insertExecutor).getQueue().size(), maxQueued));
-                    Thread.sleep(1 * Millis / (((ThreadPoolExecutor) insertExecutor).getQueue().size() > 1 ? 2 : 20));
-                }
-
-                appLog.info(String.format("Sleeping done. Queue size=%d", ((ThreadPoolExecutor) insertExecutor).getQueue().size()));
-
+            // sleep until the next task is scheduled to be executed
+            if (delay > 0) {
+                appLog.info(String.format("Sleeping %,d ms until next scheduled execution time", sleepTime));
+                Thread.sleep(sleepTime);
             }
 
-            wallTime = System.currentTimeMillis() - start;
+            while (maxQueued >= 0 && ((ThreadPoolExecutor) taskExecutor).getQueue().size() > maxQueued) {
+                appLog.info(String.format("Queue size %d is over limit %d - sleeping", ((ThreadPoolExecutor) taskExecutor).getQueue().size(), maxQueued));
+                Thread.sleep(1 * Millis / (((ThreadPoolExecutor) taskExecutor).getQueue().size() > 1 ? 2 : 20));
+            }
+
+            appLog.info(String.format("Sleeping done. Queue size=%d", ((ThreadPoolExecutor) taskExecutor).getQueue().size()));
 
             appLog.info(String.format("Processed %,d events containing %,d records in %.2f secs"
                             + "\n\tThroughput:\t%.2f events/sec at %.2f ips;"
@@ -381,11 +346,13 @@ public class Controller implements AutoCloseable {
 
 
         } while (System.currentTimeMillis() < endTime);
+
     }
 
     public void close()
     {
         try {
+            valueGenerator.stop();
             taskExecutor.shutdownNow();
             taskExecutor.awaitTermination(10, TimeUnit.SECONDS);
         }
@@ -397,7 +364,7 @@ public class Controller implements AutoCloseable {
                         + "\n\tThroughput:\t%.2f events/sec at %.2f ips;"
                         + "\n\tSpeed:\t\t%,d inserts in %.2f secs = %.2f ips"
                         + "\n\tQueries:\t%,d queries got %,d records in %.2f secs at %.2f qps",
-                ((ThreadPoolExecutor) insertExecutor).getQueue().size(),
+                ((ThreadPoolExecutor) taskExecutor).getQueue().size(),
                 totalEvents, totalInserts.get(), (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalInserts.get() / wallTime),
                 totalInserts.get(), (totalInsertTime.get() / Nano2Seconds), (Nano2Seconds * totalInserts.get() / totalInsertTime.get()),
                 totalQueries.get(), totalQueryRecords.get(), (totalQueryTime.get() / Nano2Seconds), (Nano2Seconds * totalQueries.get() / totalQueryTime.get())));
@@ -411,12 +378,15 @@ public class Controller implements AutoCloseable {
     }
 
     protected void initializeDatabase() {
-        String script = appProperties.getProperty(DB_INIT_SQL);
-        if (script == null) appLog.info("Somehow script is NULL");
 
-        appLog.info(String.format("running init sql (length: %d): %s", script.length(), script));
         try (SqlSession session = new SqlSession(SqlSession.Mode.AUTO_COMMIT)) {
-            session.execute(script);
+            for (TaskContext task : taskList) {
+                List<String> script = task.dbInitSQL;
+                if (script == null) appLog.info("Somehow script is NULL");
+
+                appLog.info(String.format("running init sql from %s (%d statements): %s", task.path, script.size(), script.toString()));
+                session.execute(script.toArray(new String[0]));
+            }
         }
     }
 
@@ -433,18 +403,12 @@ public class Controller implements AutoCloseable {
         }
     }
 
-    protected void loadProperties(Properties props, String key)
+    protected void loadProperties(Properties props, String path)
         throws MalformedURLException, IOException
     {
-        assert key != null && key.length() > 0;
+        assert path != null && path.length() > 0;
 
-        String path = appProperties.getProperty(key);
-        if (path == null || path.length() == 0) {
-            appLog.info(String.format("loadProperties: key %s not in app properties", key));
-            return;
-        }
-
-        appLog.info(String.format("loading properties: %s from %s", key, path));
+        appLog.info(String.format("loading properties: from %s", path));
 
         InputStream is = null;
 
@@ -462,7 +426,7 @@ public class Controller implements AutoCloseable {
 
         resolveReferences(props);
 
-        appLog.info(String.format("Loaded properties %s: %s", key, props));
+        appLog.info(String.format("Loaded properties %s", props));
     }
 
     protected void resolveReferences(Properties props) {
@@ -490,221 +454,338 @@ public class Controller implements AutoCloseable {
         }
     }
 
-    protected void scheduleViewTask(long eventId) {
-        if (minViewAfterInsert <= 0 || maxViewAfterInsert <= 0) return;
+    class TaskContext {
 
-        long delay = (minViewAfterInsert + random.nextInt(maxViewAfterInsert - minViewAfterInsert));
+        public final String name;
+        public final String path;
+        public final Properties properties;
+        public final float averageRate, burstProbability;
+        public final int rateSmoothing, maxRetry;
+        public final int minBurst, maxBurst;
+        public final int minViewDelay, maxViewDelay;
+        public final TxModel txModel;
+        public final SqlSession.Mode bulkCommitMode;
+        public final boolean instrumentSQL;
+        public final List<String> dbInitSQL;
+        public final String catchBlock;
+        public final Class<Runnable> updateTaskType;
+        public final Class<Runnable> queryTaskType;
+        public final List<String> updateSql;
+        public final List<String> querySql;
+        public final String[] updateValuesURI;
+        public final String[] queryValuesURI;
+        public final List<ArrayBlockingQueue<String[]>> updateValues;
+        public final List<ArrayBlockingQueue<String[]>> queryValues;
 
-        // implement warp-drive...
-        if (timingSpeedup > 1) delay /= timingSpeedup;
+        public final long averageDelay;
 
-        taskExecutor.schedule(new EventViewTask(eventId), (long) delay, TimeUnit.SECONDS);
+        public long[] timestamp;
+        public int[] count;
 
-        appLog.info(String.format("Scheduled EventViewTask for now +%d", delay));
-    }
+        public TaskContext(String path, Properties properties)
+                throws ClassNotFoundException
+        {
+            this.path = path;
+            this.properties = properties;
 
-    class EventGenerator implements Runnable {
+            appLog.info("Task properties: " + properties);
 
-        private final long unique;
-        private Date dateStamp = new Date();
+            name = properties.getProperty(TASK_NAME);
+            averageRate = Float.parseFloat(properties.getProperty(AVERAGE_RATE));
+            minBurst = Integer.parseInt(properties.getProperty(MIN_BURST));
+            maxBurst = Integer.parseInt(properties.getProperty(MAX_BURST));
+            rateSmoothing = Integer.parseInt(properties.getProperty(RATE_SMOOTHING));
+            maxRetry = Integer.parseInt(properties.getProperty(MAX_RETRY));
+            instrumentSQL = Boolean.parseBoolean(properties.getProperty(DB_INSTRUMENT_SQL));
 
-        EventGenerator(long unique) {
-            this.unique = unique;
-        }
+            minViewDelay = Integer.parseInt(properties.getProperty(MIN_VIEW_DELAY));
+            int delay = Integer.parseInt(properties.getProperty(MAX_VIEW_DELAY));
+            maxViewDelay = (delay > 0 && delay < minViewDelay ? minViewDelay : delay);
 
-        public void run() {
+            burstProbability  = (minBurst < maxBurst
+                    ? Float.parseFloat(properties.getProperty(BURST_PROBABILITY_PERCENT))
+                    : 0);
 
-            long start = System.nanoTime();
-
-            long ownerId;
-            long eventId;
-            long groupId;
-
-            // open optional outer session/transaction
-            SqlSession outerTx = (txModel == TxModel.UNIFIED ? new SqlSession(SqlSession.Mode.TRANSACTIONAL) : null);
-
-            try (SqlSession session = new SqlSession(SqlSession.Mode.AUTO_COMMIT)) {
-                ownerId = ownerRepository.persist(generateOwner());
-                System.out.println("\n------------------------------------------------");
-                report("Owner", 1, System.nanoTime() - start);
-
-                eventId = eventRepository.persist(generateEvent(ownerId));
+            if (maxBurst <= minBurst) {
+                appLog.info(String.format("maxBurst (%d) <= minBurst (%d); burst disabled", maxBurst, minBurst));
             }
 
-            int groupCount = minGroups + random.nextInt(maxGroups - minGroups);
-            appLog.info(String.format("Creating %d groups", groupCount));
+            TxModel model;
+            try { model = Enum.valueOf(TxModel.class, appProperties.getProperty(TX_MODEL)); }
+            catch (Exception e) { model = TxModel.DISCRETE; }
+            txModel = model;
 
-            int total = 2 + groupCount;
+            SqlSession.Mode mode;
+            try { mode = Enum.valueOf(SqlSession.Mode.class, appProperties.getProperty(BULK_COMMIT_MODE)); }
+            catch (Exception e) { mode = SqlSession.Mode.BATCH; }
+            bulkCommitMode = mode;
 
-            Map<String, Data> dataRows = new HashMap<String, Data>(maxData);
+            String typeName = properties.getProperty(UPDATE_TASK_CLASS);
+            updateTaskType = (Class<Runnable>) Class.forName(typeName);
+            updateSql = parseScript(properties.getProperty(DB_UPDATE_SQL));
 
-            // data records per group
-            int dataCount = (minData + random.nextInt(maxData - minData)) / groupCount;
-            appLog.info(String.format("Creating %d Data records @ %d records per group", dataCount * groupCount, dataCount));
+            typeName = properties.getProperty(QUERY_TASK_CLASS);
+            queryTaskType = (Class<Runnable>) Class.forName(typeName);
+            querySql = parseScript(properties.getProperty(DB_QUERY_SQL));
 
-            for (int gx = 0; gx < groupCount; gx++) {
-                try (SqlSession session = new SqlSession(SqlSession.Mode.AUTO_COMMIT)) {
-                    groupId = groupRepository.persist(generateGroup(eventId, gx));
+            updateValuesURI = properties.getProperty(DB_UPDATE_VALUES).split("\n");
+            queryValuesURI = properties.getProperty(DB_QUERY_VALUES).split("\n");
+
+            appLog.info("updateThreads= " + updateThreads + "; queryThreads= " + queryThreads);
+
+            updateValues = new ArrayList<ArrayBlockingQueue<String[]>>(updateValuesURI.length);
+            for (int ix = 0; ix < updateValuesURI.length; ix++) {
+                updateValues.add(new ArrayBlockingQueue<String[]>(10 * updateThreads));
+            }
+
+            queryValues = new ArrayList<ArrayBlockingQueue<String[]>>(queryValuesURI.length);
+            for (int ix = 0; ix < queryValuesURI.length; ix++) {
+                queryValues.add(new ArrayBlockingQueue<String[]>(10 * queryThreads));
+            }
+
+            catchBlock = properties.getProperty(DB_CATCH_BLOCK);
+            dbInitSQL = parseScript(properties.getProperty(DB_INIT_SQL));
+
+            averageDelay = (long) (Millis2Seconds / averageRate);
+            timestamp = new long[rateSmoothing];
+            count = new int[rateSmoothing];
+
+            timestamp[0] = System.currentTimeMillis();
+        }
+
+        public long schedule()
+            throws Exception
+        {
+            long now = System.currentTimeMillis();
+
+            int first = 0;
+            int last = timestamp.length-1;
+
+            // how far away is the last scheduled task?
+            long delay = timestamp[last] - now;
+
+            // if the last task is in the future, we still have a task queued - don't queue any more
+            if (delay > 0) return delay;
+
+            // move the rate calculation window forward
+            if (timestamp[first+1] == 0) timestamp[first+1] = timestamp[first];
+            System.arraycopy(timestamp, first+1, timestamp, first, timestamp.length-1);
+            System.arraycopy(count, first+1, count, first, count.length-1);
+
+            // randomly create a burst
+            if (burstProbability > 0 && Percent * random.nextFloat() <= burstProbability) {
+                int burstSize = minBurst + random.nextInt(maxBurst - minBurst);
+                appLog.info(String.format("Creating burst of %d", burstSize));
+
+                delay = 0;
+
+                for (int bx = 0; bx < burstSize; bx++) {
+                    scheduleTasks(unique++, delay);
                 }
 
-                total += dataCount;
+                count[last] = burstSize;
+            }
 
-                dataRows.clear();
-                for (int dx = 0; dx < dataCount; dx++) {
-                    Data data = generateData(groupId, dx);
-                    dataRows.put(data.getInstanceUID(), data);
+            else if (averageRate > 0) {
+                long duration = timestamp[last] - timestamp[0];
+
+                int totalCount = 0;
+                for (int c : count) totalCount += c;
+
+                double currentRate = (Millis2Seconds * totalCount) / duration;
+
+                delay = (long) (averageDelay * (currentRate / averageRate));
+
+                appLog.info(String.format("Current Rate= %.2f; scheduling for now + %,d ms", currentRate, delay));
+
+                if (timingSpeedup > 1) {
+                    delay /= timingSpeedup;
+                    appLog.info(String.format("Warp-drive: speedup %f; scheduling for now + %d ms", timingSpeedup, delay));
                 }
 
-                // in SP mode, the SP does the uniqueness testing - in BATCH mode we do it separately
-                if (bulkCommitMode == SqlSession.Mode.BATCH) {
-                    try (SqlSession session = new SqlSession(SqlSession.Mode.AUTO_COMMIT)) {
-                        long uniqueRows = dataRepository.checkUniqueness(dataRows);
+                scheduleTasks(unique++, delay);
 
-                        appLog.info(String.format("%d rows out of %d new rows are unique", uniqueRows, dataCount));
+                count[last] = 1;
+            }
 
-                        groupRepository.update(groupId, "dataCount", uniqueRows);
+            else {
+                delay = 0;
+                scheduleTasks(unique++, delay);
+                count[last] = 1;
+            }
+
+            timestamp[last] = now + delay;
+            return delay;
+        }
+
+        protected void scheduleTasks(long unique, long delay)
+            throws Exception
+        {
+            if (!queryOnly) {
+
+                if (delay > 0)
+                    taskExecutor.schedule(newTask(TaskType.UPDATE, unique), delay, TimeUnit.DAYS.MILLISECONDS);
+                else
+                    taskExecutor.execute(newTask(TaskType.UPDATE, unique));
+            }
+
+            if (queryOnly || (minViewDelay > 0 && maxViewDelay > 0)) {
+                scheduleViewTask(unique);
+            }
+        }
+
+        protected void scheduleViewTask(long unique)
+            throws Exception
+        {
+            long delay = (minViewDelay > 0 || maxViewDelay > 0)
+                ? minViewDelay + random.nextInt(maxViewDelay - minViewDelay)
+                : averageDelay;
+
+            // implement warp-drive...
+            if (timingSpeedup > 1) delay /= timingSpeedup;
+
+            taskExecutor.schedule(newTask(TaskType.QUERY, unique), (long) delay, TimeUnit.SECONDS);
+
+            appLog.info(String.format("Scheduled View task for now +%d", delay));
+        }
+
+        protected List<String> parseScript(String script) {
+
+            if (script == null || script.length() == 0)
+                return null;
+
+            StringBuilder statement = new StringBuilder(2048);
+            StringBuilder varList = new StringBuilder(2048);
+
+            List<String> sql = new ArrayList<String>(1024);
+
+            // for diagnostics...
+            int lineNumber = 0;
+
+            boolean multiLine = false;
+
+            String[] lines = script.split(";");
+            for (String line : lines) {
+
+                lineNumber++;
+
+                line = line.trim();
+                //System.out.println("line=" + line);
+
+                if (line.startsWith("//")) {
+                    continue;
+                }
+
+                // skip "GO" commands
+                if (line.equalsIgnoreCase("GO")) {
+                    multiLine = false;
+                    line = "";
+                }
+
+                if (line.toUpperCase().startsWith("AS")) {
+
+                    // instrument by inserting a try-catch block and debug vars
+                    if (instrumentSQL) {
+                        line = "AS\nTRY\n   VAR \"_debug_line_number INT, _debug_line_text STRING;\n" + line.substring("AS".length());
+                    }
+                } else if (line.toUpperCase().startsWith("VAR")) {
+                    if (instrumentSQL) {
+                        for (String var : line.split(",")) {
+                            String[] token = var.trim().split(" ");
+
+                            if (varList.length() > 0) varList.append("||\n");
+                            varList.append(String.format("'%s = '||%s", token[0], token[0]));
+                        }
                     }
                 }
 
-                long dataStart = System.nanoTime();
-                int count = 0;
-                try (SqlSession session = new SqlSession(bulkCommitMode)) {
-                    for (Data data : dataRows.values()) {
-                        dataRepository.persist(data);
-                        count++;
-                    }
-                    appLog.info(String.format("inserting %d data rows", count));
-                } catch (Exception e) {
-                    appLog.info(String.format("Error inserting data row %s", e.toString()));
+                // assemble multi-statement commands
+                else if (line.toUpperCase().startsWith("CREATE PROCEDURE"))
+                    multiLine = true;
+
+                else if (line.toUpperCase().startsWith("CREATE TRIGGER"))
+                    multiLine = true;
+
+                else if (line.equalsIgnoreCase("END_PROCEDURE")) {
+                    if (instrumentSQL) line = String.format(catchBlock, varList) + line;
+                    multiLine = false;
+                } else if (line.equalsIgnoreCase("END_TRIGGER")) {
+                    if (instrumentSQL) line = String.format(catchBlock, varList) + line;
+                    multiLine = false;
                 }
 
-                report("Data Group", dataCount, System.nanoTime() - dataStart);
+                if (line != null && line.length() > 0) {
+                    if (statement.length() > 0) {
+                        statement.append("; ");
+                    }
+
+                    if (instrumentSQL) {
+                        statement.append("   \"_debug_line_number\" = '").append(lineNumber).append("'; ");
+                        statement.append("   \"_debug_line_text\" = '").append(line).append("'; ");
+                    }
+
+                    statement.append(line);
+                }
+
+                //log.info("multiLine? " + multiLine);
+                if (multiLine)
+                    continue;
+
+                sql.add(statement.toString());
+                statement.setLength(0);
             }
 
-            if (outerTx != null) outerTx.close();
-
-            long duration = System.nanoTime() - start;
-            report("All Data", total, duration);
-
-            //totalInserts += total;
-            //totalInsertTime += duration;
-
-            totalInserts.addAndGet(total);
-            totalInsertTime.addAndGet(duration);
-
-            scheduleViewTask(eventId);
-        }
-
-        protected Owner generateOwner() {
-
-            Owner owner = new Owner();
-            owner.setCustomerId(unique % 200);
-            owner.setOwnerGuid(String.format("Owner-GUID-%d", unique));
-            owner.setDateCreated(dateStamp);
-            owner.setLastUpdated(dateStamp);
-            owner.setName(String.format("Owner-%d", unique));
-            owner.setMasterAliasId(unique);
-            owner.setRegion(unique % 2 == 0 ? "Region_A" : "Region_B");
-
-            return owner;
-            //return ownerRepository.persist(owner);
-        }
-
-        protected Event generateEvent(long ownerId) {
-
-            Event ev = new Event();
-            ev.setCustomerId(unique % 200);
-            ev.setOwnerId(ownerId);
-            ev.setEventGuid(String.format("Event-GUID-%d", unique));
-            ev.setName(String.format("Event-%d", unique));
-            ev.setDescription("Test data generated by CSNuoTest");
-            ev.setDateCreated(dateStamp);
-            ev.setLastUpdated(dateStamp);
-            ev.setRegion(unique % 2 == 0 ? "Region_A" : "Region_B");
-
-            return ev;
-            //return eventRepository.persist(event);
-        }
-
-        protected Group generateGroup(long eventId, int index) {
-
-            Group group = new Group();
-            group.setEventId(eventId);
-            group.setGroupGuid(String.format("Group-%d-%d", unique, index));
-            //group.setGroupGuid(String.Join("-", "Group", unique, index);
-            group.setDataCount(0);
-            group.setDateCreated(dateStamp);
-            group.setLastUpdated(dateStamp);
-            group.setRegion(unique % 2 == 0 ? "Region_A" : "Region_B");
-            group.setWeek(unique / 35000);
-
-            return group;
-            //return groupRepository.persist(group);
-        }
-
-        protected Data generateData(long groupId, int index) {
-            //String suffix = string.Join("-", unique, groupId, index);
-            //String instanceUID = "image-"+suffix;
-            String instanceUID = String.format("image-%d-%d-%d", unique, groupId, index);
-
-            Data data = new Data();
-            data.setGroupId(groupId);
-            data.setDataGuid("Data-" + instanceUID);
-            data.setInstanceUID(instanceUID);
-            data.setCreatedDateTime(dateStamp);
-            data.setAcquiredDateTime(dateStamp);
-            data.setVersion(0);
-            data.setActive(true);
-            data.setSizeOnDiskMB(65.5F);
-            data.setRegionWeek(String.format("%s%d", (unique % 2 == 0 ? "Region_A-" : "Region_B-"), (unique / 35000)));
-
-            return data;
-        }
-
-        private void report(String name, int count, long duration) {
-            double rate = (count > 0 && duration > 0 ? Nano2Seconds * count / duration : 0);
-            appLog.info(String.format("Run %d; generated %s (%,d records); duration=%.2f ms; rate=%.2f", unique, name, count, 1d / Nano2Millis * duration, rate));
-        }
-    }
-
-    class EventViewTask implements Runnable {
-        private final long eventId;
-
-        public EventViewTask(long eventId) {
-            this.eventId = eventId;
-        }
-
-        @Override
-        public void run() {
-
-            //long x = totalInserts;
-
-            viewLog.info(String.format("Running view query for event %d", eventId));
-
-            try (SqlSession session = new SqlSession(SqlSession.Mode.READ_ONLY, "Query")) {
-
-                long start = System.nanoTime();
-                EventDetails details = eventRepository.getDetails(eventId);
-                if (details == null) return;
-
-                long duration = System.nanoTime() - start;
-
-                totalQueries.incrementAndGet();
-                totalQueryRecords.addAndGet(details.getData().size());
-                totalQueryTime.addAndGet(duration);
-
-                appLog.info(String.format("Event viewed. Query response time= %.2f secs; %,d Data objects attached in %d groups.",
-                        (duration / Nano2Seconds), details.getData().size(), details.getGroups().size()));
-
-            } catch (PersistenceException e) {
-                viewLog.info(String.format("Error retrieving Event: %s", e.toString()));
-                e.printStackTrace(System.out);
+            if (instrumentSQL) {
+                appLog.info("Instrumented SQL init script");
+                for (String line : sql) System.out.println("\t" + line);
             }
 
+            return sql;
+        }
 
-            if (queryBackoff > 0 && ((ThreadPoolExecutor) insertExecutor).getQueue().size() > maxQueued) {
-                appLog.info(String.format("(query) Queue size > maxQueued (%d); sleeping for %d ms...", maxQueued, queryBackoff));
-                try { Thread.sleep(queryBackoff); } catch (InterruptedException e) {}
+        protected Runnable newTask(TaskType taskType, long unique)
+            throws Exception
+        {
+            String errors = "";
+
+            Class<? extends Runnable> type;
+            List<String> sql;
+
+
+            switch (taskType) {
+                case UPDATE:
+                    type = updateTaskType;
+                    sql = updateSql;
+                    break;
+
+                case QUERY:
+                    type = queryTaskType;
+                    sql = querySql;
+                    break;
+
+                default:
+                    throw new ConfigurationException("Unrecognised TaskType: %s", taskType.name());
+            }
+
+            try { return type.getConstructor(long.class, TaskType.class, TaskContext.class).newInstance(unique, taskType, this); }
+            catch (Exception e) { errors = errors + " (long, TaskType, TaskContext);"; }
+
+            try { return type.getConstructor(long.class, List.class, Properties.class).newInstance(unique, sql, properties); }
+            catch (Exception e) { errors = errors + " (long, List<String>, Properties);"; }
+
+            try { return type.getConstructor(long.class, Properties.class).newInstance(unique, properties); }
+            catch (Exception e) { errors = errors + " (long, Properties);"; }
+
+            try { return type.getConstructor(long.class).newInstance(unique); }
+            catch (Exception e) { errors = errors + " (long);"; }
+
+            try { return type.getConstructor(String.class).newInstance(name); }
+            catch (Exception e) { errors = errors + " (String);"; }
+
+            try { return type.getConstructor().newInstance(); }
+            catch (Exception e) {
+                throw new ConfigurationException("Task construction failure. Could not find a suitable Constructor for %s. Tried %s",
+                        type.getName(), errors);
             }
         }
     }
