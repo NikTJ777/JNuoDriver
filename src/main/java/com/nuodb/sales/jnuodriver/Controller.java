@@ -721,12 +721,12 @@ public class Controller implements AutoCloseable {
                 }
 
                 else if (stmnt.equalsIgnoreCase("END_PROCEDURE")) {
-                    if (instrumentSQL) stmnt = String.format(catchBlock, "''") + ";\n" + stmnt;
+                    if (instrumentSQL) stmnt = String.format(catchBlock, "'*none in scope*'") + ";\n" + stmnt;
                     multiLine = false;
                 }
 
                 else if (stmnt.equalsIgnoreCase("END_TRIGGER")) {
-                    if (instrumentSQL) stmnt = String.format(catchBlock, "''") + ";\n" + stmnt;
+                    if (instrumentSQL) stmnt = String.format(catchBlock, "'*none in scope'") + ";\n" + stmnt;
                     multiLine = false;
                 }
 
@@ -756,7 +756,7 @@ public class Controller implements AutoCloseable {
 
                             // insert debug vars and a try-catch block at the very start
                             if (line.toUpperCase().startsWith("AS")) {
-                                lines[lx] = "AS\n   VAR \"_debug_line_number\" INT, \"_debug_line_text\" STRING;\n   TRY\n";
+                                lines[lx] = "AS\n   VAR \"_debug_line_number\" INT, \"_debug_line_text\" STRING;\nTRY";
                             }
 
                             // since statements can be multi-line, identify the first obvious SQL statement in the block
@@ -766,11 +766,11 @@ public class Controller implements AutoCloseable {
                                     || line.toUpperCase().startsWith("INSERT")
                                     || line.toUpperCase().startsWith("DELETE")
                             )) {
-                                lines[lx] = String.format("   \"_debug_line_number\" = %d; \"_debug_line_text\" = '%s';\nTRY\n   %2$s",
+                                lines[lx] = String.format("   \"_debug_line_number\" = %d; \"_debug_line_text\" = '%s';\n   TRY\n\t%2$s",
                                         lineNumber, line.replaceAll("'", ""));
 
                                 int last = lines.length-1;
-                                lines[last] = lines[last] + ";\n" + String.format(catchBlock, varList);
+                                lines[last] = lines[last] + ";\n   " + String.format(catchBlock, varList);
                                 foundSQL = true;
                             }
 
