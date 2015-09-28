@@ -255,11 +255,12 @@ public class Controller implements AutoCloseable {
         taskExecutor = Executors.newScheduledThreadPool(totalThreads);
 
         if ("true".equalsIgnoreCase(appProperties.getProperty("check.config"))) {
+            appLog.info("\n***** check.config set - testing ValueGenerator *****\n");
             valueGenerator.start();
-            try { Thread.sleep(3000); }
+            try { Thread.sleep(500); }
             catch (InterruptedException e) {}
 
-            System.out.println("CheckConfig called - nothing to do; exiting.");
+            System.out.println("check.config set - nothing to do; exiting.");
             System.exit(0);
         }
     }
@@ -277,7 +278,6 @@ public class Controller implements AutoCloseable {
                 appLog.info(String.format("lastEventID = %s", unique));
             }
         }
-
     }
 
     /**
@@ -316,11 +316,31 @@ public class Controller implements AutoCloseable {
             wallTime = now - start;
             appLog.info(String.format("now=%d; endTime=%d;  elapsed=%d; time left=%d", now, endTime, wallTime, endTime - now));
 
+            int inactive = 0;
+
             sleepTime = endTime - now;
             long delay = 0;
             for (TaskContext task : taskList) {
+                if (! task.isActive()) {
+                    inactive++;
+                    continue;
+                }
+
                 delay = task.schedule();
+                if (delay < 0) {
+                    task.setActive(false);
+                    inactive++;
+                    continue;
+                }
+
                 if (delay < sleepTime) sleepTime = delay;
+            }
+
+            appLog.info("inactive=" + inactive);
+
+            if (inactive >= taskList.size()) {
+                appLog.info("All tasks are inactive - exiting");
+                return;
             }
 
             // sleep until the next task is scheduled to be executed
@@ -346,7 +366,6 @@ public class Controller implements AutoCloseable {
 
 
         } while (System.currentTimeMillis() < endTime);
-
     }
 
     public void close()
@@ -456,6 +475,8 @@ public class Controller implements AutoCloseable {
 
     class TaskContext {
 
+        private volatile boolean active = false;
+
         public final String name;
         public final String path;
         public final Properties properties;
@@ -551,12 +572,26 @@ public class Controller implements AutoCloseable {
             count = new int[rateSmoothing];
 
             timestamp[0] = System.currentTimeMillis();
+
+            active = true;
         }
+
+        public void setActive(boolean active)
+        {
+            appLog.info("task active set to " + active);
+            this.active = active;
+        }
+
+        public boolean isActive()
+        { return active; }
 
         public long schedule()
             throws Exception
         {
             long now = System.currentTimeMillis();
+
+            if (! active)
+                return -1;
 
             int first = 0;
             int last = timestamp.length-1;
@@ -664,72 +699,117 @@ public class Controller implements AutoCloseable {
 
             boolean multiLine = false;
 
-            String[] lines = script.split(";");
-            for (String line : lines) {
+            String[] statements = script.split(";");
+            for (String stmnt : statements) {
 
-                lineNumber++;
-
-                line = line.trim();
-                //System.out.println("line=" + line);
-
-                if (line.startsWith("//")) {
-                    continue;
-                }
-
-                // skip "GO" commands
-                if (line.equalsIgnoreCase("GO")) {
-                    multiLine = false;
-                    line = "";
-                }
-
-                if (line.toUpperCase().startsWith("AS")) {
-
-                    // instrument by inserting a try-catch block and debug vars
-                    if (instrumentSQL) {
-                        line = "AS\nTRY\n   VAR \"_debug_line_number INT, _debug_line_text STRING;\n" + line.substring("AS".length());
-                    }
-                } else if (line.toUpperCase().startsWith("VAR")) {
-                    if (instrumentSQL) {
-                        for (String var : line.split(",")) {
-                            String[] token = var.trim().split(" ");
-
-                            if (varList.length() > 0) varList.append("||\n");
-                            varList.append(String.format("'%s = '||%s", token[0], token[0]));
-                        }
-                    }
-                }
+                stmnt = stmnt.trim();
+                System.out.println("stmnt=" + stmnt);
 
                 // assemble multi-statement commands
-                else if (line.toUpperCase().startsWith("CREATE PROCEDURE"))
+                if (stmnt.toUpperCase().startsWith("CREATE PROCEDURE")) {
                     multiLine = true;
+                    lineNumber = 0;
+                    varList.setLength(0);
+                    varList.append("''");
+                }
 
-                else if (line.toUpperCase().startsWith("CREATE TRIGGER"))
+                else if (stmnt.toUpperCase().startsWith("CREATE TRIGGER")) {
                     multiLine = true;
+                    lineNumber = 0;
+                    varList.setLength(0);
+                    varList.append("''");
+                }
 
-                else if (line.equalsIgnoreCase("END_PROCEDURE")) {
-                    if (instrumentSQL) line = String.format(catchBlock, varList) + line;
-                    multiLine = false;
-                } else if (line.equalsIgnoreCase("END_TRIGGER")) {
-                    if (instrumentSQL) line = String.format(catchBlock, varList) + line;
+                else if (stmnt.equalsIgnoreCase("END_PROCEDURE")) {
+                    if (instrumentSQL) stmnt = String.format(catchBlock, "''") + ";\n" + stmnt;
                     multiLine = false;
                 }
 
-                if (line != null && line.length() > 0) {
+                else if (stmnt.equalsIgnoreCase("END_TRIGGER")) {
+                    if (instrumentSQL) stmnt = String.format(catchBlock, "''") + ";\n" + stmnt;
+                    multiLine = false;
+                }
+
+                appLog.info("stmnt is now: " + stmnt);
+
+                if (stmnt != null && stmnt.length() > 0) {
+
+                    String[] lines = stmnt.split("\n");
+                    boolean foundSQL = false;
+
+                    for (int lx = 0; lx < lines.length; lx++) {
+                        String line = lines[lx].trim();
+                        lineNumber++;
+
+                        if (line.startsWith("//") || line.startsWith("--")) {
+                            continue;
+                        }
+
+                        // skip "GO" commands
+                        else if (line.equalsIgnoreCase("GO")) {
+                            multiLine = false;
+                            lines[lx] = "";
+                        }
+
+                        // insert TRY immediately after the AS element
+                        else if (multiLine && instrumentSQL) {
+
+                            // insert debug vars and a try-catch block at the very start
+                            if (line.toUpperCase().startsWith("AS")) {
+                                lines[lx] = "AS\n   VAR \"_debug_line_number\" INT, \"_debug_line_text\" STRING;\n   TRY\n";
+                            }
+
+                            // since statements can be multi-line, identify the first obvious SQL statement in the block
+                            else if (foundSQL == false
+                                    && (line.toUpperCase().startsWith("UPDATE")
+                                    || line.toUpperCase().startsWith("SELECT")
+                                    || line.toUpperCase().startsWith("INSERT")
+                                    || line.toUpperCase().startsWith("DELETE")
+                            )) {
+                                lines[lx] = String.format("   \"_debug_line_number\" = %d; \"_debug_line_text\" = '%s';\nTRY\n   %2$s",
+                                        lineNumber, line.replaceAll("'", ""));
+
+                                int last = lines.length-1;
+                                lines[last] = lines[last] + ";\n" + String.format(catchBlock, varList);
+                                foundSQL = true;
+                            }
+
+                            // maintain a list of all VAR declarations - for printout on error
+                            else if (line.toUpperCase().startsWith("VAR")) {
+                                for (String var : line.split(",")) {
+                                    if (var.toUpperCase().startsWith("VAR"))
+                                        var = var.substring("VAR".length()).trim();
+
+                                    String[] token = var.trim().split(" ");
+
+                                    if (varList.length() > 0) varList.append("||\n");
+                                    varList.append(String.format("'%s = '||%s", token[0], token[0]));
+                                }
+                            }
+                        }
+                    }
+
+                    // now assemble the statement
                     if (statement.length() > 0) {
+                        if (instrumentSQL && multiLine) {
+                            statement.append(";\n   \"_debug_line_number\" = '").append(lineNumber).append("'");
+                            statement.append(";\n   \"_debug_line_text\" = '").append(lines[0].replaceAll("'", "")).append("'");
+                        }
+
                         statement.append("; ");
                     }
 
-                    if (instrumentSQL) {
-                        statement.append("   \"_debug_line_number\" = '").append(lineNumber).append("'; ");
-                        statement.append("   \"_debug_line_text\" = '").append(line).append("'; ");
+                    // reassemble the statement from the lines
+                    for (String line : lines) {
+                        if (line.length() > 0) statement.append('\n').append(line);
                     }
-
-                    statement.append(line);
                 }
 
                 //log.info("multiLine? " + multiLine);
                 if (multiLine)
                     continue;
+
+                appLog.info("statement = " + statement.toString() + '\n');
 
                 sql.add(statement.toString());
                 statement.setLength(0);

@@ -1,14 +1,11 @@
 package com.nuodb.sales.jnuodriver;
 
-import com.nuodb.sales.jnuodriver.dao.ConfigurationException;
 import com.nuodb.sales.jnuodriver.dao.PersistenceException;
 
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
-import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
-import java.util.Properties;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.logging.Logger;
 
@@ -56,27 +53,42 @@ public class GenericTask implements Runnable {
     @Override
     public void run()
     {
-        do {
-            for (int retry = 0; retry <= maxRetry; retry++) {
-                try (SqlSession session = new SqlSession(SqlSession.Mode.TRANSACTIONAL)) {
+        Object[][] params = new Object[sql.size()][];
 
-                    try {
-                        // get the prepared statements
-                        PreparedStatement[] psList = new PreparedStatement[sql.size()];
-                        for (int sx = 0; sx < psList.length; sx++) psList[sx] = session.getStatement(sql.get(sx));
+        try {
+            for (int px = 0; px < params.length; px++) {
+                Object[] val = values.get(px).take();
+                if (val.length == 0) {
+                    log.info("got empty vlues set - deactivating task: " + context.name);
+                    context.setActive(false);
+                    return;
+                }
 
-                        for (int px = 0; px < psList.length; px++) {
-                            setParams(psList[px], values.get(px).take());
+                params[px] = val;
+            }
+        }
+        catch (InterruptedException e) {}
 
-                            psList[px].execute();
-                        }
-                    } catch (Exception e) {
-                        log.info(String.format("Error executing task %s\n\t%s", context.name, e.toString()));
-                        if (!session.retry(e)) break;
+        for (int retry = 0; retry <= maxRetry; retry++) {
+            try (SqlSession session = new SqlSession(SqlSession.Mode.TRANSACTIONAL)) {
+
+                try {
+                    // get the prepared statements
+                    PreparedStatement[] psList = new PreparedStatement[sql.size()];
+                    for (int sx = 0; sx < psList.length; sx++) psList[sx] = session.getStatement(sql.get(sx));
+
+                    for (int px = 0; px < psList.length; px++) {
+
+                        setParams(psList[px], params[px]);
+
+                        psList[px].execute();
                     }
+                } catch (Exception e) {
+                    log.info(String.format("Error executing task %s\n\t%s", context.name, e.toString()));
+                    if (!session.retry(e)) break;
                 }
             }
-        } while (true);
+        }
     }
 
     /**

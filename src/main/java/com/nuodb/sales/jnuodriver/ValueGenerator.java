@@ -7,10 +7,7 @@ import java.io.FileReader;
 import java.io.InputStreamReader;
 import java.io.LineNumberReader;
 import java.net.URL;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -74,18 +71,35 @@ public class ValueGenerator implements Runnable {
 
             for (int ix = 0; ix < input.size(); ix++) {
 
+                SetReader in = input.get(ix);
+                ArrayBlockingQueue<String[]> out = output.get(ix);
+
                 // skip if we have no room
-                if (output.get(ix).remainingCapacity() <= 0) {
+                if (out.remainingCapacity() <= 0) {
                     full++;
                     continue;
                 }
 
-                set = input.get(ix).read(unique++);
+                // skip if we have no input
+                if (! in.isOpen()) {
+                    empty++;
+                    continue;
+                }
+
+                set = in.read(unique++);
+
+                // close the reader if it has reached EOF
+                if (set == null || set.length == 0) {
+                    in.close();
+                    empty++;
+                    continue;
+                }
+
                 log.info("values: " + Arrays.toString(set));
 
                 if (set.length > 0) {
-                    if (! output.get(ix).offer(set)) {
-                        log.info(String.format("Internal error: failed to add values to queue: %s", input.get(ix).getName()));
+                    if (! out.offer(set)) {
+                        log.info(String.format("Internal error: failed to add values to queue: %s", in.getName()));
                     }
                 } else {
                     empty++;
@@ -105,6 +119,11 @@ public class ValueGenerator implements Runnable {
 
                 sleepTime = 0;
             }
+        }
+
+        // clean up
+        for (SetReader reader : input) {
+            reader.close();
         }
 
         log.info(String.format("Exiting (running = %b)", running));
@@ -132,6 +151,7 @@ public class ValueGenerator implements Runnable {
         public String getName();
         public String[] read(long unique);
         public void close();
+        public boolean isOpen();
     }
 
     public interface SetParser {
@@ -140,6 +160,8 @@ public class ValueGenerator implements Runnable {
 }
 
 class FileSetReader implements ValueGenerator.SetReader {
+
+    private volatile boolean open = false;
     private String url;
     private LineNumberReader reader;
     ValueGenerator.SetParser parser;
@@ -161,6 +183,8 @@ class FileSetReader implements ValueGenerator.SetReader {
             default:
                 throw new ConfigurationException("Unsupported file type: %s", suffix);
         }
+
+        open = true;
     }
 
     public String getName() {
@@ -168,17 +192,21 @@ class FileSetReader implements ValueGenerator.SetReader {
     }
 
     public void close() {
+        open = false;
+
         if (reader != null) {
             try { reader.close(); }
             catch (Exception e) {}
         }
     }
 
+    public boolean isOpen()
+    { return open; }
+
     public String[] read(long unique) {
         try {
             String line = reader.readLine();
-            ValueGenerator.log.info("(" + reader.getLineNumber() + ") line=" + line);
-            if (line == null) return ValueGenerator.EMPTY_STRING_ARRAY;
+            if (line == null || line.length() == 0) return ValueGenerator.EMPTY_STRING_ARRAY;
 
             return parser.parse(line);
         }
@@ -217,8 +245,7 @@ class CsvSetParser implements ValueGenerator.SetParser {
 
                         // strip enclosing quotes
                         if (val.startsWith("\"") && val.endsWith("\"")) {
-                            val = val.substring(1, val.length()-1);
-                            //val = val.replaceAll("\"\"", "\"");       // convert embedded quote-quote to quote
+                            val = val.substring(1, val.length() - 1);
                             val = doubleQuote.matcher(val).replaceAll("\"");
                         }
 
@@ -239,6 +266,7 @@ class CsvSetParser implements ValueGenerator.SetParser {
 
 class FormatSetReader implements ValueGenerator.SetReader {
 
+    private volatile boolean open = false;
     private String uri;
     private String[] value;
     private String[] format;
@@ -276,6 +304,8 @@ class FormatSetReader implements ValueGenerator.SetReader {
 
             //log.info("value: " + value[fx] + "; format: " + format[fx]);
         }
+
+        open = true;
     }
 
     @Override
@@ -284,7 +314,11 @@ class FormatSetReader implements ValueGenerator.SetReader {
     }
 
     @Override
-    public void close() {}
+    public void close()
+    { open = false; }
+
+    public boolean isOpen()
+    { return open; }
 
     @Override
     public String[] read(long unique) {
