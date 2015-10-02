@@ -1,4 +1,6 @@
 sku101, 10, Mfr01
 sku102, 20, Mfr01
 "sku"",""103", 30, Mfr01
+sku104, ${taskId}, Mfr01
+sku105, 50, Mfr01
 

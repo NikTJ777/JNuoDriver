@@ -1,0 +1,13 @@
+<component name="libraryTable">
+  <library name="Maven: com.nuodb:nuodb-jdbc:3.0-PRERELEASE">
+    <CLASSES>
+      <root url="jar://$MAVEN_REPOSITORY$/com/nuodb/nuodb-jdbc/3.0-PRERELEASE/nuodb-jdbc-3.0-PRERELEASE.jar!/" />
+    </CLASSES>
+    <JAVADOC>
+      <root url="jar://$MAVEN_REPOSITORY$/com/nuodb/nuodb-jdbc/3.0-PRERELEASE/nuodb-jdbc-3.0-PRERELEASE-javadoc.jar!/" />
+    </JAVADOC>
+    <SOURCES>
+      <root url="jar://$MAVEN_REPOSITORY$/com/nuodb/nuodb-jdbc/3.0-PRERELEASE/nuodb-jdbc-3.0-PRERELEASE-sources.jar!/" />
+    </SOURCES>
+  </library>
+</component>

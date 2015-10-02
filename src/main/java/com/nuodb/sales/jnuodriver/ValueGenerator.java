@@ -2,14 +2,12 @@ package com.nuodb.sales.jnuodriver;
 
 import com.nuodb.sales.jnuodriver.dao.ConfigurationException;
 
-import java.io.BufferedReader;
-import java.io.FileReader;
-import java.io.InputStreamReader;
-import java.io.LineNumberReader;
-import java.net.URL;
+import java.io.*;
+import java.lang.reflect.Constructor;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -21,16 +19,41 @@ public class ValueGenerator implements Runnable {
 
     private List<SetReader> input = new ArrayList<SetReader>(64);
     private List<ArrayBlockingQueue<String[]>> output = new ArrayList<ArrayBlockingQueue<String[]>>(64);
+    private Map<String, Object> locals = new HashMap<String, Object>(256);
 
+    private static Map<String, Constructor<? extends SetReader>> typeMap = new HashMap<String, Constructor<? extends SetReader>>(32);
     private static final long fullSleepTime = 20;
     private static final long emptySleepTime = 200;
 
-    private long unique;
     private volatile boolean running = false;
 
     public static final String[] EMPTY_STRING_ARRAY = new String[0];
 
     static final Logger log = Logger.getLogger(ValueGenerator.class.getName());
+
+    static {
+        try {
+            addReader("none", NullSetReader.class.getName());
+            addReader("file", FileSetReader.class.getName());
+            addReader("format", FormatSetReader.class.getName());
+        } catch (Exception e) {
+            throw new RuntimeException("Erk! Invalid SetReader implementation (class undefined, or missing null constructor)\n" + e.toString());
+        }
+    }
+
+    public static void addReader(String type, String className)
+        throws Exception
+    {
+        Class<? extends SetReader> classType = (Class<? extends SetReader>) Class.forName(className);
+        Constructor<? extends SetReader> ctor = classType.getConstructor();
+
+        if (typeMap.containsKey(type)) {
+            String oldType = typeMap.remove(type).getDeclaringClass().getName();
+            log.info(String.format("Redefining SetReader for type %s from %s -> %s", type, oldType, className));
+        }
+
+        typeMap.put(type, ctor);
+    }
 
     public void addSource(Controller.TaskContext context)
         throws Exception
@@ -65,9 +88,14 @@ public class ValueGenerator implements Runnable {
 
         running = true;
 
+        long unique = 0;
+        long uniqueSet = 0;
+
         while (running) {
 
             full = empty = 0;
+
+            locals.put("taskId", new Long(uniqueSet++));
 
             for (int ix = 0; ix < input.size(); ix++) {
 
@@ -86,7 +114,9 @@ public class ValueGenerator implements Runnable {
                     continue;
                 }
 
-                set = in.read(unique++);
+                locals.put("statementId", new Long(unique++));
+
+                set = in.read(unique);
 
                 // close the reader if it has reached EOF
                 if (set == null || set.length == 0) {
@@ -130,24 +160,26 @@ public class ValueGenerator implements Runnable {
     }
 
     protected SetReader getReader(String uri)
-        throws Exception
-    {
+        throws Exception {
         log.info("getReader - uri = " + uri);
 
-        String prefix = uri.substring(0, uri.indexOf(':'));
-        switch (prefix) {
-            case "file":
-                return new FileSetReader(uri);
+        String type = uri.substring(0, uri.indexOf(':'));
 
-            case "format":
-                return new FormatSetReader(uri);
+        try {
+            SetReader reader = typeMap.get(type).newInstance();
+            reader.setURI(uri);
+            reader.setGlobalMap(locals);
 
-            default:
-                throw new ConfigurationException("ValueGenerator: unsupported value URI type: %s", prefix);
+            return reader;
+        }
+        catch (Exception e) {
+            throw new ConfigurationException("Invalid SetReader type: %s:\n", type, e.toString());
         }
     }
 
     public interface SetReader {
+        public void setURI(String uri) throws Exception;
+        public void setGlobalMap(Map<String, Object> global);
         public String getName();
         public String[] read(long unique);
         public void close();
@@ -159,14 +191,50 @@ public class ValueGenerator implements Runnable {
     }
 }
 
+class NullSetReader implements ValueGenerator.SetReader {
+    private String uri;
+
+    public NullSetReader() {}
+
+    @Override
+    public void setURI(String uri) throws Exception {
+        this.uri = uri;
+    }
+
+    @Override
+    public void setGlobalMap(Map<String, Object> global) {}
+
+    @Override
+    public String getName() {
+        return uri;
+    }
+
+    @Override
+    public String[] read(long unique) {
+        return ValueGenerator.EMPTY_STRING_ARRAY;
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public boolean isOpen() {
+        return true;
+    }
+}
+
 class FileSetReader implements ValueGenerator.SetReader {
 
     private volatile boolean open = false;
     private String url;
+    private Map<String, Object> globals;
+
     private LineNumberReader reader;
     ValueGenerator.SetParser parser;
 
-    public FileSetReader(String url)
+    public FileSetReader() {}
+
+    public void setURI(String url)
         throws Exception
     {
         this.url = url;
@@ -185,6 +253,10 @@ class FileSetReader implements ValueGenerator.SetReader {
         }
 
         open = true;
+    }
+
+    public void setGlobalMap(Map<String, Object> globals) {
+        this.globals = globals;
     }
 
     public String getName() {
@@ -208,9 +280,22 @@ class FileSetReader implements ValueGenerator.SetReader {
             String line = reader.readLine();
             if (line == null || line.length() == 0) return ValueGenerator.EMPTY_STRING_ARRAY;
 
-            return parser.parse(line);
+            String [] result = parser.parse(line);
+
+            // resolve any global variable references
+            for (int rx = 0; rx < result.length; rx++) {
+                String val = result[rx];
+                if (val.startsWith("${") && val.endsWith("}")) {
+                    Object resolved = globals.get(val.replaceAll("\\$|\\{|\\}", ""));
+                    result[rx] = (resolved != null ? resolved.toString() : "");
+                    //Logger.getLogger("readValue").info(String.format("resolved var %s -> %s", val, result[rx]));
+                }
+            }
+
+            return result;
         }
         catch (Exception e) {
+            Logger.getLogger("FileFormatter.read").info("Error reading line: " + e.toString());
             return ValueGenerator.EMPTY_STRING_ARRAY;
         }
     }
@@ -231,34 +316,34 @@ class CsvSetParser implements ValueGenerator.SetParser {
 
         ValueGenerator.log.info("CSV line=" + line);
 
-        for (int cx = 0; cx < line.length(); cx++) {
-            switch (line.charAt(cx)) {
-                case '"':
-                    quoted = !quoted;
-                    break;
+        int max = line.length()-1;
+        for (int cx = 0; cx <= max; cx++) {
 
-                case ',':
-                    if (!quoted) {
-                        String val = line.substring(start, cx).trim();
+            char c = line.charAt(cx);
+            if (c == '"') {
+                quoted = !quoted;
+            }
 
-                        ValueGenerator.log.info("CSV token=" + val);
+            else if ((c == ',' && quoted == false) || cx == max) {
+                if (!quoted) {
+                    String val = line.substring(start, cx).trim();
 
-                        // strip enclosing quotes
-                        if (val.startsWith("\"") && val.endsWith("\"")) {
-                            val = val.substring(1, val.length() - 1);
-                            val = doubleQuote.matcher(val).replaceAll("\"");
-                        }
+                    ValueGenerator.log.info("CSV token=" + val);
 
-
-                        set.add(val);
-
-                        start = cx+1;
+                    // strip enclosing quotes
+                    if (val.startsWith("\"") && val.endsWith("\"")) {
+                        val = val.substring(1, val.length() - 1);
+                        val = doubleQuote.matcher(val).replaceAll("\"");
                     }
-                    break;
+
+                    set.add(val);
+
+                    start = cx+1;
+                }
             }
         }
 
-        if (start < line.length()-1) set.add(line.substring(start).trim());
+        //if (start < line.length()-1) set.add(line.substring(start).trim());
 
         return set.toArray(ValueGenerator.EMPTY_STRING_ARRAY);
     }
@@ -268,11 +353,22 @@ class FormatSetReader implements ValueGenerator.SetReader {
 
     private volatile boolean open = false;
     private String uri;
+    private Map<String, Object> globals;
     private String[] value;
     private String[] format;
 
-    private static Pattern genVal = Pattern.compile("%([~|#].*)\\$(.*)");
-    private Random random = new Random();
+    private static Pattern genVal = Pattern.compile("(.*)%([~|@].*)\\$([\\p{Digit}\\p{Punct}]*)(\\p{Alpha}+)(.*)");
+    private static Random random = new Random();
+
+    private static final DateFormat dateFormatter = new SimpleDateFormat("yyyy/MM/dd");
+    private static final DateFormat dateTimeFormatter = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
+
+    private static final long msecsInADay = 3600*24*1000;
+
+    private static long NOW = System.currentTimeMillis();
+
+    //private static Calendar nowCalendar = new GregorianCalendar();
+    //private static long timezoneOffset = nowCalendar.get(Calendar.ZONE_OFFSET) + nowCalendar.get(Calendar.DST_OFFSET);
 
     private static char[] printable = new char[] {
             'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
@@ -284,10 +380,14 @@ class FormatSetReader implements ValueGenerator.SetReader {
 
     private static Logger log = Logger.getLogger(FormatSetReader.class.getName());
 
-    public FormatSetReader(String uri) {
+    public FormatSetReader() {}
+
+    @Override
+    public void setURI(String uri) {
         this.uri = uri;
 
-        String[] fields = uri.substring(uri.indexOf(':') + 2).split(",");
+        String[] fields = uri.substring(uri.indexOf(':') + 3).split(",");
+        //log.info("fields=" + Arrays.toString(fields));
 
         value = new String[fields.length];
         format = new String[fields.length];
@@ -295,8 +395,12 @@ class FormatSetReader implements ValueGenerator.SetReader {
         for (int fx = 0; fx < fields.length; fx++) {
             Matcher match = genVal.matcher(fields[fx].trim());
             if (match.find()) {
-                value[fx] = match.group(2).charAt(match.group(2).length()-1) + match.group(1);
-                format[fx] = String.format("%%%d$%s", fx+1, match.group(2));
+                //for (int gx = 1; gx <= match.groupCount(); gx++) {
+                //    log.info(String.format("group[%d] = %s", gx, match.group(gx)));
+                //}
+                value[fx] = String.format("%s%s%s", match.group(2).charAt(0), match.group(4).charAt(0), match.group(2).substring(1));
+                format[fx] = String.format("%s%%%d$%s%s%s", match.group(1), fx+1, match.group(3), match.group(4), match.group(5));
+                //log.info("value specs=" + Arrays.toString(value) + "; format specs=" + Arrays.toString(format));
             } else {
                 value[fx] = "";
                 format[fx] = fields[fx].trim();
@@ -306,6 +410,11 @@ class FormatSetReader implements ValueGenerator.SetReader {
         }
 
         open = true;
+    }
+
+    @Override
+    public void setGlobalMap(Map<String, Object> globals) {
+        this.globals = globals;
     }
 
     @Override
@@ -329,25 +438,19 @@ class FormatSetReader implements ValueGenerator.SetReader {
         // generate the value array
         for (int fx = 0; fx < format.length; fx++) {
 
-            if (value[fx] != null && value[fx].length() > 0) {
+            String genSpec = value[fx];
 
-                //log.info("value spec: " + value[fx]);
+            if (genSpec != null && genSpec.length() > 0) {
 
-                switch (value[fx].charAt(1)) {
-                    case '~':
-                        // random value
-                        genval[fx] = generateValue(fx);
-                        break;
+                //log.info("value spec: " + genSpec);
 
-                    case '#':
-                        // unique value
-                        genval[fx] = unique;
-                        break;
-
-                    default:
-                        log.info(String.format("Unrecognised value generation char: %s", value[fx].charAt(1)));
-                        return ValueGenerator.EMPTY_STRING_ARRAY;
+                try {
+                    genval[fx] = generateValue(genSpec, globals);
+                } catch (Exception e) {
+                    log.info(String.format("Error generating value for %s:\n%s", genSpec, e.toString()));
+                    return ValueGenerator.EMPTY_STRING_ARRAY;
                 }
+
             }
         }
 
@@ -361,11 +464,26 @@ class FormatSetReader implements ValueGenerator.SetReader {
         return result;
     }
 
-    protected Object generateValue(int fieldNo) {
+    public static Object generateValue(String genSpec, Map<String, Object> globals)
+        throws Exception
+    {
+        char type = genSpec.charAt(0);
+
+        if (type == '@') {
+                // global var reference
+                // log.info("locals=" + locals.toString());
+                return globals.get(genSpec.substring(2));
+        }
+
+        else if (type != '~') {
+            log.info(String.format("Unrecognised value generation char: %s", type));
+            return ValueGenerator.EMPTY_STRING_ARRAY;
+        }
 
         String[] range;
-        if (value[fieldNo].length() > 2) {
-            range = value[fieldNo].substring(2).split("-");
+
+        if (genSpec.length() > 2) {
+            range = genSpec.substring(2).split("-");
         } else {
             range = ValueGenerator.EMPTY_STRING_ARRAY;
         }
@@ -374,7 +492,7 @@ class FormatSetReader implements ValueGenerator.SetReader {
 
         //log.info("type=" + value[fieldNo].charAt(0));
 
-        switch (value[fieldNo].charAt(0)) {
+        switch (genSpec.charAt(1)) {
             case 'd':
             case 'o':
             case 'x':
@@ -382,13 +500,16 @@ class FormatSetReader implements ValueGenerator.SetReader {
                 if (range.length == 0)
                     return random.nextInt();
 
-                int min = Integer.parseInt(range[0]);
-                int max = (range.length > 1 ? Integer.parseInt(range[1]) : min);
+                long min = (range.length > 1 ? Long.parseLong(range[0]) : 0);
+                long max = (range.length > 1 ? Long.parseLong(range[1]) : Long.parseLong(range[0]));
 
-                if (range.length > 1)
-                    return (min + random.nextInt(max - min));
+                // if both min and max are Integer values, return an Integer...
+                if (min >= Integer.MIN_VALUE && max <= Integer.MAX_VALUE)
+                    return ((int) (min + random.nextInt((int) (max - min))));
+
+                // otherwise, return a Long
                 else
-                    return random.nextInt(max);
+                    return (long) (min + (random.nextDouble() * (max - min)));
             }
 
             case 'f':
@@ -401,13 +522,10 @@ class FormatSetReader implements ValueGenerator.SetReader {
                 if (range.length == 0)
                     return random.nextDouble();
 
-                double min = Double.parseDouble(range[0]);
-                double max = (range.length > 1 ? Double.parseDouble(range[1]) : min);
+                double min = (range.length > 1 ? Double.parseDouble(range[0]) : 0);
+                double max = (range.length > 1 ? Double.parseDouble(range[1]) : Double.parseDouble(range[0]));
 
-                if (range.length > 1)
-                    return (min + ((max - min) * random.nextDouble()));
-                else
-                    return max * random.nextDouble();
+                return (min + ((max - min) * random.nextDouble()));
             }
 
             case 's':
@@ -426,8 +544,21 @@ class FormatSetReader implements ValueGenerator.SetReader {
                 return str.toString();
             }
 
+            case 't':
+            case 'T': {
+                DateFormat dateFmt = (range.length == 0 || range[0].contains(" ") ? dateTimeFormatter : dateFormatter);
+
+                //long min = (range.length > 0 ? dateFmt.parse(range[0]).getTime() : NOW - (NOW % msecsInADay));
+                long min = (range.length > 0 ? dateFmt.parse(range[0]).getTime() : NOW);
+                long max = (range.length > 1 ? dateFmt.parse(range[1]).getTime() : min + msecsInADay-1);
+
+                //log.info(String.format("min=%d (%1$tF %1$tR); max=%d (%2$tF %2$tR)", min, max));
+
+                return new Date(min + (long) (random.nextDouble() * (max-min))).getTime();
+            }
+
             default:
-                log.info(String.format("Unhandled data type: %s", value[fieldNo].charAt(0)));
+                log.info(String.format("Unhandled data type: %s", genSpec.charAt(0)));
                 return '?';
         }
     }

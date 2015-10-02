@@ -3,10 +3,11 @@ package com.nuodb.sales.jnuodriver;
 import com.nuodb.sales.jnuodriver.dao.ConfigurationException;
 import com.nuodb.sales.jnuodriver.service.Service;
 
-import java.io.IOException;
-import java.io.InputStream;
+import java.io.*;
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.nio.ByteOrder;
+import java.nio.CharBuffer;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -55,6 +56,7 @@ public class Controller implements AutoCloseable {
     public static final String TASK_PROPERTIES_PATHS = "task.properties.paths";
     public static final String UPDATE_TASK_CLASS =  "update.task.class";
     public static final String QUERY_TASK_CLASS =   "query.task.class";
+    public static final String VALUE_READER_CLASSES = "valueReader.classes";
     public static final String AVERAGE_RATE =       "timing.rate";
     public static final String MAX_RETRY =          "max.retry";
     public static final String RATE_SMOOTHING =     "rate.smoothing";
@@ -74,6 +76,7 @@ public class Controller implements AutoCloseable {
     public static final String MAX_BURST =          "max.burst";
     public static final String DB_INIT =            "db.init";
     public static final String DB_INSTRUMENT_SQL =  "db.instrument.sql";
+    public static final String DB_CLEAR_SQL =       "db.clear.sql";
     public static final String DB_INIT_SQL =        "db.init.sql";
     public static final String DB_UPDATE_SQL =      "db.update.sql";
     public static final String DB_UPDATE_VALUES =   "db.update.values";
@@ -95,6 +98,8 @@ public class Controller implements AutoCloseable {
     protected enum TxModel { DISCRETE, UNIFIED }
 
     public enum TaskType { UPDATE, QUERY }
+
+    static final Pattern VariableReferencePattern = Pattern.compile("\\$\\{[^\\}]+\\}");
 
     private static Logger appLog = Logger.getLogger("JNuoTest");
     private static Logger insertLog = Logger.getLogger("InsertLog");
@@ -230,6 +235,18 @@ public class Controller implements AutoCloseable {
             System.exit(0);
         }
 
+        String valueReaderClasses = appProperties.getProperty(VALUE_READER_CLASSES);
+        if (valueReaderClasses != null && valueReaderClasses.length() > 0) {
+            for (String defn : valueReaderClasses.split(",")) {
+                String[] token = defn.split("(=|:)");
+
+                if (token.length == 2)
+                    ValueGenerator.addReader(token[0], token[1]);
+                else
+                    throw new ConfigurationException("Invalid reader class definition. Expected: 'type=className'; got: ", defn);
+            }
+        }
+
         taskList = new ArrayList<TaskContext>(64);
         valueGenerator = new ValueGenerator();
 
@@ -274,7 +291,7 @@ public class Controller implements AutoCloseable {
             unique = 1;
         } else {
             try (SqlSession session = new SqlSession(SqlSession.Mode.AUTO_COMMIT)) {
-                unique = service.getUnique() + 1;
+                //unique = service.getUnique() + 1;
                 appLog.info(String.format("lastEventID = %s", unique));
             }
         }
@@ -398,10 +415,24 @@ public class Controller implements AutoCloseable {
 
     protected void initializeDatabase() {
 
+        List<TaskContext> reverseTaskList = new ArrayList<TaskContext>(taskList);
+        Collections.reverse(reverseTaskList);
+
         try (SqlSession session = new SqlSession(SqlSession.Mode.AUTO_COMMIT)) {
+
+            // run the clear scripts in reverse order
+            for (TaskContext task : reverseTaskList) {
+                List<String> script = task.dbClearSQL;
+                if (script == null) appLog.info("Somehow clear script is NULL in " + task.name);
+
+                appLog.info(String.format("running clear sql from %s (%d statements): %s", task.path, script.size(), script.toString()));
+                session.execute(script.toArray(new String[0]));
+            }
+
+            // run the init scripts in the specified order
             for (TaskContext task : taskList) {
                 List<String> script = task.dbInitSQL;
-                if (script == null) appLog.info("Somehow script is NULL");
+                if (script == null) appLog.info("Somehow init script is NULL in " + task.name);
 
                 appLog.info(String.format("running init sql from %s (%d statements): %s", task.path, script.size(), script.toString()));
                 session.execute(script.toArray(new String[0]));
@@ -449,27 +480,39 @@ public class Controller implements AutoCloseable {
     }
 
     protected void resolveReferences(Properties props) {
-        Pattern var = Pattern.compile("\\$\\{[^\\}]+\\}");
         StringBuffer newVar = new StringBuffer();
 
         for (Map.Entry<Object, Object> entry : props.entrySet()) {
 
-            Matcher match = var.matcher(entry.getValue().toString());
-            while (match.find()) {
-                //appLog.info(String.format("match.group=%s", match.group()));
-                //String val = props.getProperty(match.group().replaceAll("\\$|\\{|\\}", ""));
-                String val = appProperties.getProperty(match.group().replaceAll("\\$|\\{|\\}", ""));
-                appLog.info(String.format("resolving var reference %s to %s", match.group(), val));
+            appLog.info(String.format("resolving %s", entry.getValue()));
 
-                if (val != null) match.appendReplacement(newVar, val);
-            }
+            resolveReferences(entry.getValue().toString(), newVar);
 
             if (newVar.length() > 0) {
                 appLog.info(String.format("Replacing updated property %s=%s", entry.getKey(), newVar));
-                match.appendTail(newVar);
                 entry.setValue(newVar.toString());
-                newVar.setLength(0);
             }
+        }
+    }
+
+    protected void resolveReferences(String property, StringBuffer output) {
+
+        Matcher match = VariableReferencePattern.matcher(property);
+        output.setLength(0);
+
+        while (match.find()) {
+
+            //appLog.info(String.format("match.group=%s", match.group()));
+            //String val = props.getProperty(match.group().replaceAll("\\$|\\{|\\}", ""));
+            String val = appProperties.getProperty(match.group().replaceAll("\\$|\\{|\\}", ""));
+            appLog.info(String.format("resolving var reference %s to %s", match.group(), val));
+
+            if (val != null) match.appendReplacement(output, val);
+        }
+
+        if (output.length() > 0) {
+            //appLog.info(String.format("Replacing updated property %s=%s", entry.getKey(), newVar));
+            match.appendTail(output);
         }
     }
 
@@ -487,6 +530,7 @@ public class Controller implements AutoCloseable {
         public final TxModel txModel;
         public final SqlSession.Mode bulkCommitMode;
         public final boolean instrumentSQL;
+        public final List<String> dbClearSQL;
         public final List<String> dbInitSQL;
         public final String catchBlock;
         public final Class<Runnable> updateTaskType;
@@ -504,7 +548,7 @@ public class Controller implements AutoCloseable {
         public int[] count;
 
         public TaskContext(String path, Properties properties)
-                throws ClassNotFoundException
+                throws Exception
         {
             this.path = path;
             this.properties = properties;
@@ -565,6 +609,7 @@ public class Controller implements AutoCloseable {
             }
 
             catchBlock = properties.getProperty(DB_CATCH_BLOCK);
+            dbClearSQL = parseScript(properties.getProperty(DB_CLEAR_SQL));
             dbInitSQL = parseScript(properties.getProperty(DB_INIT_SQL));
 
             averageDelay = (long) (Millis2Seconds / averageRate);
@@ -615,7 +660,7 @@ public class Controller implements AutoCloseable {
                 delay = 0;
 
                 for (int bx = 0; bx < burstSize; bx++) {
-                    scheduleTasks(unique++, delay);
+                    scheduleTasks(delay);
                 }
 
                 count[last] = burstSize;
@@ -638,14 +683,14 @@ public class Controller implements AutoCloseable {
                     appLog.info(String.format("Warp-drive: speedup %f; scheduling for now + %d ms", timingSpeedup, delay));
                 }
 
-                scheduleTasks(unique++, delay);
+                scheduleTasks(delay);
 
                 count[last] = 1;
             }
 
             else {
                 delay = 0;
-                scheduleTasks(unique++, delay);
+                scheduleTasks(delay);
                 count[last] = 1;
             }
 
@@ -653,15 +698,15 @@ public class Controller implements AutoCloseable {
             return delay;
         }
 
-        protected void scheduleTasks(long unique, long delay)
+        protected void scheduleTasks(long delay)
             throws Exception
         {
             if (!queryOnly) {
 
                 if (delay > 0)
-                    taskExecutor.schedule(newTask(TaskType.UPDATE, unique), delay, TimeUnit.DAYS.MILLISECONDS);
+                    taskExecutor.schedule(newTask(TaskType.UPDATE), delay, TimeUnit.DAYS.MILLISECONDS);
                 else
-                    taskExecutor.execute(newTask(TaskType.UPDATE, unique));
+                    taskExecutor.execute(newTask(TaskType.UPDATE));
             }
 
             if (queryOnly || (minViewDelay > 0 && maxViewDelay > 0)) {
@@ -679,15 +724,37 @@ public class Controller implements AutoCloseable {
             // implement warp-drive...
             if (timingSpeedup > 1) delay /= timingSpeedup;
 
-            taskExecutor.schedule(newTask(TaskType.QUERY, unique), (long) delay, TimeUnit.SECONDS);
+            taskExecutor.schedule(newTask(TaskType.QUERY), (long) delay, TimeUnit.SECONDS);
 
             appLog.info(String.format("Scheduled View task for now +%d", delay));
         }
 
-        protected List<String> parseScript(String script) {
+        protected List<String> parseScript(String script)
+            throws Exception
+        {
 
             if (script == null || script.length() == 0)
                 return null;
+
+            // support sql in discrete files
+            if (script.toLowerCase().startsWith("file://")) {
+                try (LineNumberReader reader = new LineNumberReader(new FileReader(script.substring("file://".length())))) {
+                    StringBuffer buffer = new StringBuffer(1024);
+                    String line= null;
+                    do {
+                        line = reader.readLine();
+                        appLog.info("read script line: " + line);
+                        if (line != null && line.length() > 0) buffer.append(line).append('\n');
+                    } while (line != null);
+
+                    // resolve any references in the script
+                    resolveReferences(buffer.toString(), buffer);
+                    script = buffer.toString();
+
+                } catch (Exception e) {
+                    throw new ConfigurationException("Error reading SQL script file: %s\n(%s)", script, e.toString());
+                }
+            }
 
             StringBuilder statement = new StringBuilder(2048);
             StringBuilder varList = new StringBuilder(2048);
@@ -823,7 +890,7 @@ public class Controller implements AutoCloseable {
             return sql;
         }
 
-        protected Runnable newTask(TaskType taskType, long unique)
+        protected Runnable newTask(TaskType taskType)
             throws Exception
         {
             String errors = "";
@@ -847,17 +914,14 @@ public class Controller implements AutoCloseable {
                     throw new ConfigurationException("Unrecognised TaskType: %s", taskType.name());
             }
 
-            try { return type.getConstructor(long.class, TaskType.class, TaskContext.class).newInstance(unique, taskType, this); }
-            catch (Exception e) { errors = errors + " (long, TaskType, TaskContext);"; }
+            try { return type.getConstructor(long.class, TaskType.class, TaskContext.class).newInstance(taskType, this); }
+            catch (Exception e) { errors = errors + " (TaskType, TaskContext);"; }
 
-            try { return type.getConstructor(long.class, List.class, Properties.class).newInstance(unique, sql, properties); }
-            catch (Exception e) { errors = errors + " (long, List<String>, Properties);"; }
+            try { return type.getConstructor(long.class, List.class, Properties.class).newInstance(sql, properties); }
+            catch (Exception e) { errors = errors + " (List<String>, Properties);"; }
 
-            try { return type.getConstructor(long.class, Properties.class).newInstance(unique, properties); }
-            catch (Exception e) { errors = errors + " (long, Properties);"; }
-
-            try { return type.getConstructor(long.class).newInstance(unique); }
-            catch (Exception e) { errors = errors + " (long);"; }
+            try { return type.getConstructor(long.class, Properties.class).newInstance(properties); }
+            catch (Exception e) { errors = errors + " (Properties);"; }
 
             try { return type.getConstructor(String.class).newInstance(name); }
             catch (Exception e) { errors = errors + " (String);"; }
