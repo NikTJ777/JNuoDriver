@@ -6,8 +6,6 @@ import com.nuodb.sales.jnuodriver.service.Service;
 import java.io.*;
 import java.net.MalformedURLException;
 import java.net.URL;
-import java.nio.ByteOrder;
-import java.nio.CharBuffer;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -37,9 +35,9 @@ public class Controller implements AutoCloseable {
     AtomicLong totalInserts = new AtomicLong();
     AtomicLong totalInsertTime = new AtomicLong();
 
-    AtomicLong totalQueries = new AtomicLong();
-    AtomicLong totalQueryRecords = new AtomicLong();
-    AtomicLong totalQueryTime = new AtomicLong();
+    AtomicLong totalRetrieved = new AtomicLong();
+    AtomicLong totalRetrievedRecords = new AtomicLong();
+    AtomicLong totalRetrieveTime = new AtomicLong();
 
     long unique;
 
@@ -100,6 +98,7 @@ public class Controller implements AutoCloseable {
     public enum TaskType { UPDATE, QUERY }
 
     static final Pattern VariableReferencePattern = Pattern.compile("\\$\\{[^\\}]+\\}");
+    static final Pattern ScriptStatementPattern = Pattern.compile("^\\{\\s*(\\S*?)\\s*\\}\\s*([\\p{Punct}\\p{Alpha}])(.*)$");
 
     private static Logger appLog = Logger.getLogger("JNuoTest");
     private static Logger insertLog = Logger.getLogger("InsertLog");
@@ -379,7 +378,7 @@ public class Controller implements AutoCloseable {
                             + "\n\tQueries:\t%,d queries got %,d records in %.2f secs at %.2f qps",
                     totalEvents, totalInserts.get(), (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalInserts.get() / wallTime),
                     totalInserts.get(), (totalInsertTime.get() / Nano2Seconds), (Nano2Seconds * totalInserts.get() / totalInsertTime.get()),
-                    totalQueries.get(), totalQueryRecords.get(), (totalQueryTime.get() / Nano2Seconds), (Nano2Seconds * totalQueries.get() / totalQueryTime.get())));
+                    totalRetrieved.get(), totalRetrievedRecords.get(), (totalRetrieveTime.get() / Nano2Seconds), (Nano2Seconds * totalRetrieved.get() / totalRetrieveTime.get())));
 
 
         } while (System.currentTimeMillis() < endTime);
@@ -403,7 +402,7 @@ public class Controller implements AutoCloseable {
                 ((ThreadPoolExecutor) taskExecutor).getQueue().size(),
                 totalEvents, totalInserts.get(), (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalInserts.get() / wallTime),
                 totalInserts.get(), (totalInsertTime.get() / Nano2Seconds), (Nano2Seconds * totalInserts.get() / totalInsertTime.get()),
-                totalQueries.get(), totalQueryRecords.get(), (totalQueryTime.get() / Nano2Seconds), (Nano2Seconds * totalQueries.get() / totalQueryTime.get())));
+                totalRetrieved.get(), totalRetrievedRecords.get(), (totalRetrieveTime.get() / Nano2Seconds), (Nano2Seconds * totalRetrieved.get() / totalRetrieveTime.get())));
 
         //appLog.info(String.format("Exiting with %d items remaining in the queue.\n\tProcessed %,d events containing %,d records in %.2f secs\n\tThroughput:\t%.2f events/sec at %.2f ips;\n\tSpeed:\t\t%,d inserts in %.2f secs = %.2f ips",
         //        ((ThreadPoolExecutor) insertExecutor).getQueue().size(),
@@ -547,6 +546,14 @@ public class Controller implements AutoCloseable {
         public long[] timestamp;
         public int[] count;
 
+        AtomicLong totalUpdates = new AtomicLong();
+        AtomicLong totalUpdateTime = new AtomicLong();
+
+        AtomicLong totalQueries = new AtomicLong();
+        AtomicLong totalQueryRecords = new AtomicLong();
+        AtomicLong totalQueryTime = new AtomicLong();
+
+
         public TaskContext(String path, Properties properties)
                 throws Exception
         {
@@ -629,6 +636,33 @@ public class Controller implements AutoCloseable {
 
         public boolean isActive()
         { return active; }
+
+        public void updateTimes(Controller.TaskType type, long time, long statements, long rows)
+            throws Exception
+        {
+            switch (type) {
+                case UPDATE:
+                    totalUpdates.addAndGet(statements);
+                    totalUpdateTime.addAndGet(time);
+
+                    totalInserts.addAndGet(statements);
+                    totalInsertTime.addAndGet(time);
+                    break;
+
+                case QUERY:
+                    totalQueries.addAndGet(statements);
+                    totalQueryRecords.addAndGet(rows);
+                    totalQueryTime.addAndGet(time);
+
+                    totalRetrieved.addAndGet(statements);
+                    totalRetrievedRecords.addAndGet(rows);
+                    totalRetrieveTime.addAndGet(time);
+                    break;
+
+                default:
+                    throw new ConfigurationException("Invalid task type %s", type.name());
+            }
+        }
 
         public long schedule()
             throws Exception
@@ -736,29 +770,10 @@ public class Controller implements AutoCloseable {
             if (script == null || script.length() == 0)
                 return null;
 
-            // support sql in discrete files
-            if (script.toLowerCase().startsWith("file://")) {
-                try (LineNumberReader reader = new LineNumberReader(new FileReader(script.substring("file://".length())))) {
-                    StringBuffer buffer = new StringBuffer(1024);
-                    String line= null;
-                    do {
-                        line = reader.readLine();
-                        appLog.info("read script line: " + line);
-                        if (line != null && line.length() > 0) buffer.append(line).append('\n');
-                    } while (line != null);
-
-                    // resolve any references in the script
-                    resolveReferences(buffer.toString(), buffer);
-                    script = buffer.toString();
-
-                } catch (Exception e) {
-                    throw new ConfigurationException("Error reading SQL script file: %s\n(%s)", script, e.toString());
-                }
-            }
-
             StringBuilder statement = new StringBuilder(2048);
             StringBuilder varList = new StringBuilder(2048);
 
+            List<String> statements;
             List<String> sql = new ArrayList<String>(1024);
 
             // for diagnostics...
@@ -766,11 +781,38 @@ public class Controller implements AutoCloseable {
 
             boolean multiLine = false;
 
-            String[] statements = script.split(";");
-            for (String stmnt : statements) {
+            statements = new LinkedList<String>(Arrays.asList(script.split(";")));
+            for (int sx = 0; sx < statements.size(); sx++) {
+                String stmnt = statements.get(sx).trim();
 
-                stmnt = stmnt.trim();
                 System.out.println("stmnt=" + stmnt);
+
+                // support sql in discrete files
+                if (stmnt.toLowerCase().startsWith("file://")) {
+                    statements.remove(sx);
+
+                    List<String> scriptlet = Arrays.asList(readScript(script).split(";"));
+
+                    if (sx < statements.size()-1)
+                        statements.addAll(sx, scriptlet);
+                    else
+                        statements.addAll(scriptlet);
+
+                    // continue with the replaced line
+                    sx--;
+                    continue;
+                }
+
+                System.out.println("stmnt has become: " + stmnt);
+
+                // extract action, and store it as a statement annotation (on a preceding line)
+                Matcher match = ScriptStatementPattern.matcher(stmnt);
+                if (match.find()) {
+                    sql.add(String.format("{%s%s}", match.group(2), match.group(1)));
+                    stmnt = match.group(3);
+                }
+
+                System.out.println("extracted stmnt is: " + stmnt);
 
                 // assemble multi-statement commands
                 if (stmnt.toUpperCase().startsWith("CREATE PROCEDURE")) {
@@ -888,6 +930,27 @@ public class Controller implements AutoCloseable {
             }
 
             return sql;
+        }
+
+        protected String readScript(String path)
+            throws Exception
+        {
+            try (LineNumberReader reader = new LineNumberReader(new FileReader(path.substring("file://".length())))) {
+                StringBuffer buffer = new StringBuffer(1024);
+                String line= null;
+                do {
+                    line = reader.readLine();
+                    appLog.info("read script line: " + line);
+                    if (line != null && line.length() > 0) buffer.append(line).append('\n');
+                } while (line != null);
+
+                // resolve any references in the script
+                resolveReferences(buffer.toString(), buffer);
+
+                return buffer.toString();
+            } catch (Exception e) {
+                throw new ConfigurationException("Error reading SQL script file: %s\n(%s)", path, e.toString());
+            }
         }
 
         protected Runnable newTask(TaskType taskType)

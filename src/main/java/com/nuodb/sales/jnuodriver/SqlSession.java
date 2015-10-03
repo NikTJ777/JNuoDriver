@@ -248,6 +248,11 @@ public class SqlSession implements AutoCloseable {
 
             for (String line : script) {
                 statement = line;
+                if (statement.charAt(0) == '{') {
+                    log.info("ignoring action: " + statement);
+                    continue;
+                }
+                
                 log.info(String.format("executing statement %s", statement));
                 sql.execute(statement);
             }

@@ -79,6 +79,12 @@ public class ValueGenerator implements Runnable {
         running = false;
     }
 
+    public static Object resolveValue(String genSpec, Map<String, Object> globals)
+        throws Exception
+    {
+        return FormatSetReader.resolveValue(FormatSetReader.parseGenspec(genSpec, 0)[0], globals);
+    }
+
     @Override
     public void run() {
 
@@ -173,7 +179,8 @@ public class ValueGenerator implements Runnable {
             return reader;
         }
         catch (Exception e) {
-            throw new ConfigurationException("Invalid SetReader type: %s:\n", type, e.toString());
+            e.printStackTrace();
+            throw new ConfigurationException("Invalid SetReader type: %s\n", type, e.toString());
         }
     }
 
@@ -280,13 +287,14 @@ class FileSetReader implements ValueGenerator.SetReader {
             String line = reader.readLine();
             if (line == null || line.length() == 0) return ValueGenerator.EMPTY_STRING_ARRAY;
 
-            String [] result = parser.parse(line);
+            String[] result = parser.parse(line);
 
             // resolve any global variable references
             for (int rx = 0; rx < result.length; rx++) {
                 String val = result[rx];
-                if (val.startsWith("${") && val.endsWith("}")) {
-                    Object resolved = globals.get(val.replaceAll("\\$|\\{|\\}", ""));
+                if (val.endsWith("}") && (val.startsWith("{") || val.startsWith("${"))) {
+                    //Object resolved = globals.get(val.replaceAll("\\$|\\{|\\}", ""));
+                    Object resolved = ValueGenerator.resolveValue(val, globals);
                     result[rx] = (resolved != null ? resolved.toString() : "");
                     //Logger.getLogger("readValue").info(String.format("resolved var %s -> %s", val, result[rx]));
                 }
@@ -296,6 +304,7 @@ class FileSetReader implements ValueGenerator.SetReader {
         }
         catch (Exception e) {
             Logger.getLogger("FileFormatter.read").info("Error reading line: " + e.toString());
+            e.printStackTrace();
             return ValueGenerator.EMPTY_STRING_ARRAY;
         }
     }
@@ -357,7 +366,9 @@ class FormatSetReader implements ValueGenerator.SetReader {
     private String[] value;
     private String[] format;
 
-    private static Pattern genVal = Pattern.compile("(.*)%([~|@].*)\\$([\\p{Digit}\\p{Punct}]*)(\\p{Alpha}+)(.*)");
+    private static final Pattern fmtGenSpec = Pattern.compile("(.*)%(~[\\p{Digit}\\p{Punct}]*)?(\\p{Alpha}+)?\\$([\\p{Digit}\\p{Punct}]*)(\\p{Alpha}+)(.*)");
+    private static final Pattern varGenSPec = Pattern.compile("(.*?)\\$?\\{(~[\\p{Digit}\\p{Punct}]*)?(\\p{Alpha}+)?\\s*,?\\s*([\\p{Digit}\\p{Punct}]*)(\\p{Alpha}?)\\}(.*)");
+
     private static Random random = new Random();
 
     private static final DateFormat dateFormatter = new SimpleDateFormat("yyyy/MM/dd");
@@ -393,20 +404,12 @@ class FormatSetReader implements ValueGenerator.SetReader {
         format = new String[fields.length];
 
         for (int fx = 0; fx < fields.length; fx++) {
-            Matcher match = genVal.matcher(fields[fx].trim());
-            if (match.find()) {
-                //for (int gx = 1; gx <= match.groupCount(); gx++) {
-                //    log.info(String.format("group[%d] = %s", gx, match.group(gx)));
-                //}
-                value[fx] = String.format("%s%s%s", match.group(2).charAt(0), match.group(4).charAt(0), match.group(2).substring(1));
-                format[fx] = String.format("%s%%%d$%s%s%s", match.group(1), fx+1, match.group(3), match.group(4), match.group(5));
-                //log.info("value specs=" + Arrays.toString(value) + "; format specs=" + Arrays.toString(format));
-            } else {
-                value[fx] = "";
-                format[fx] = fields[fx].trim();
-            }
+            String[] valFmt = parseGenspec(fields[fx], fx);
 
-            //log.info("value: " + value[fx] + "; format: " + format[fx]);
+            value[fx] = valFmt[0];
+            format[fx] = valFmt[1];
+
+            log.info("value: " + value[fx] + "; format: " + format[fx]);
         }
 
         open = true;
@@ -445,7 +448,7 @@ class FormatSetReader implements ValueGenerator.SetReader {
                 //log.info("value spec: " + genSpec);
 
                 try {
-                    genval[fx] = generateValue(genSpec, globals);
+                    genval[fx] = resolveValue(genSpec, globals);
                 } catch (Exception e) {
                     log.info(String.format("Error generating value for %s:\n%s", genSpec, e.toString()));
                     return ValueGenerator.EMPTY_STRING_ARRAY;
@@ -464,15 +467,86 @@ class FormatSetReader implements ValueGenerator.SetReader {
         return result;
     }
 
-    public static Object generateValue(String genSpec, Map<String, Object> globals)
+    public static String[] parseGenspec(String genSpec, int index) {
+        String[] result = new String[2];
+
+        genSpec = genSpec.trim();
+
+        // look for each possible format in turn
+        boolean isVarFormat = (genSpec.endsWith("}") && (genSpec.startsWith("{") || genSpec.startsWith("${")));
+        Matcher match = (isVarFormat ? varGenSPec.matcher(genSpec) : fmtGenSpec.matcher(genSpec));
+
+        if (match.find() && (match.group(2) != null || match.group(3) != null)) {
+            for (int gx = 1; gx <= match.groupCount(); gx++) {
+                log.info(String.format("group[%d] = %s", gx, match.group(gx)));
+            }
+
+            String genType = (match.group(5) != null && match.group(5).length() > 0 ? match.group(5) : "r");
+
+            if (match.group(2) != null)
+                result[0] = String.format("%s%s", genType.charAt(0), match.group(2));
+            else if (match.group(3) != null)
+                result[0] = String.format("%s:%s", genType.charAt(0), match.group(3));
+
+            result[1] = String.format("%s%%%d$%s%s%s", match.group(1), index+1, match.group(4), genType, match.group(6));
+            log.info("genSpec=" + result[0] + "; format=" + result[1]);
+        } else {
+            result[0] = "";
+            result[1] = genSpec;
+        }
+
+        return result;
+    }
+
+    public static Object resolveValue(String genSpec, Map<String, Object> globals)
         throws Exception
     {
-        char type = genSpec.charAt(0);
+        char type = genSpec.charAt(1);
 
-        if (type == '@') {
+        if (type == ':') {
                 // global var reference
                 // log.info("locals=" + locals.toString());
-                return globals.get(genSpec.substring(2));
+                Object result = globals.get(genSpec.substring(2));
+
+                switch (genSpec.charAt(0)) {
+                    case 'r':
+                    case 'R':
+                        return result;
+
+                    case 'd':
+                    case 'o':
+                    case 'x':
+                    case 'X':
+                        return Long.parseLong(result.toString());
+
+                    case 'f':
+                    case 'e':
+                    case 'E':
+                    case 'g':
+                    case 'G':
+                    case 'a':
+                    case 'A':
+                        return Double.parseDouble(result.toString());
+
+                    case 's':
+                    case 'S':
+                        return result.toString();
+
+                    case 't':
+                    case 'T': {
+                        if (result instanceof Date) return result;
+                        if (result instanceof Number) return new Date(((Number) result).longValue());
+
+                        String str = result.toString();
+                        DateFormat dateFmt = (str.contains(" ") ? dateTimeFormatter : dateFormatter);
+                        return dateFmt.parse(str);
+                    }
+
+                    default:
+                        log.info(String.format("Unhandled data type: %s", genSpec.charAt(0)));
+                        return '?';
+
+                }
         }
 
         else if (type != '~') {
@@ -492,7 +566,7 @@ class FormatSetReader implements ValueGenerator.SetReader {
 
         //log.info("type=" + value[fieldNo].charAt(0));
 
-        switch (genSpec.charAt(1)) {
+        switch (genSpec.charAt(0)) {
             case 'd':
             case 'o':
             case 'x':
