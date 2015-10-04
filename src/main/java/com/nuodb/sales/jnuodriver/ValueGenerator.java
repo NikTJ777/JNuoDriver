@@ -59,13 +59,17 @@ public class ValueGenerator implements Runnable {
         throws Exception
     {
         for (int ix = 0; ix < context.updateValuesURI.length; ix++) {
-            input.add(getReader(context.updateValuesURI[ix]));
-            output.add(context.updateValues.get(ix));
+            if (context.updateValuesURI[ix] != null && context.updateValuesURI[ix].length() > 0) {
+                input.add(getReader(context.updateValuesURI[ix]));
+                output.add(context.updateValues.get(ix));
+            }
         }
 
         for (int ix = 0; ix < context.queryValuesURI.length; ix++) {
-            input.add(getReader(context.queryValuesURI[ix]));
-            output.add(context.queryValues.get(ix));
+            if (context.queryValuesURI[ix] != null && context.queryValuesURI[ix].length() > 0) {
+                input.add(getReader(context.queryValuesURI[ix]));
+                output.add(context.queryValues.get(ix));
+            }
         }
     }
 
