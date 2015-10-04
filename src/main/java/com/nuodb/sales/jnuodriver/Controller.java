@@ -322,7 +322,7 @@ public class Controller implements AutoCloseable {
         Thread.sleep(settleTime);
 
         // start the value generator
-        //valueGenerator.start();
+        valueGenerator.start();
 
         do {
             totalEvents++;
