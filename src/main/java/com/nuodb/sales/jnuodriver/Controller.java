@@ -977,13 +977,13 @@ public class Controller implements AutoCloseable {
                     throw new ConfigurationException("Unrecognised TaskType: %s", taskType.name());
             }
 
-            try { return type.getConstructor(long.class, TaskType.class, TaskContext.class).newInstance(taskType, this); }
+            try { return type.getConstructor(TaskType.class, TaskContext.class).newInstance(taskType, this); }
             catch (Exception e) { errors = errors + " (TaskType, TaskContext);"; }
 
-            try { return type.getConstructor(long.class, List.class, Properties.class).newInstance(sql, properties); }
+            try { return type.getConstructor(List.class, Properties.class).newInstance(sql, properties); }
             catch (Exception e) { errors = errors + " (List<String>, Properties);"; }
 
-            try { return type.getConstructor(long.class, Properties.class).newInstance(properties); }
+            try { return type.getConstructor(Properties.class).newInstance(properties); }
             catch (Exception e) { errors = errors + " (Properties);"; }
 
             try { return type.getConstructor(String.class).newInstance(name); }
