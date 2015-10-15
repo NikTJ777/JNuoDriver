@@ -1,13 +1,16 @@
 package com.nuodb.sales.jnuodriver;
 
 import com.nuodb.sales.jnuodriver.dao.ConfigurationException;
+import sun.org.mozilla.javascript.ast.Block;
 
 import java.io.*;
+import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -21,6 +24,8 @@ public class ValueGenerator implements Runnable {
     private List<ArrayBlockingQueue<String[]>> output = new ArrayList<ArrayBlockingQueue<String[]>>(64);
     private Map<String, Object> locals = new HashMap<String, Object>(256);
 
+    private Object semaphore = new Object();
+
     private static Map<String, Constructor<? extends SetReader>> typeMap = new HashMap<String, Constructor<? extends SetReader>>(32);
     private static final long fullSleepTime = 20;
     private static final long emptySleepTime = 200;
@@ -33,7 +38,7 @@ public class ValueGenerator implements Runnable {
 
     static {
         try {
-            addReader("none", NullSetReader.class.getName());
+            //addReader("none", NullSetReader.class.getName());
             addReader("file", FileSetReader.class.getName());
             addReader("format", FormatSetReader.class.getName());
         } catch (Exception e) {
@@ -83,6 +88,31 @@ public class ValueGenerator implements Runnable {
         running = false;
     }
 
+    public void awaken() {
+        log.info("waking generator thread...");
+        synchronized (semaphore) {
+            semaphore.notify();
+        }
+        log.info("woke generator thread.");
+    }
+
+    public static void resolveDeferredValues(Object[] values, Map<String, Object> globals)
+        throws Exception
+    {
+        //log.info("resolving: " + Arrays.toString(values));
+        //log.info("globals=" + globals.toString());
+
+        for (int vx = 0; vx < values.length; vx++) {
+            String strVal = values[vx].toString().trim();
+            //log.info("strval=" + strVal);
+            if (strVal.endsWith("}") && ((strVal.startsWith("{") || strVal.startsWith("${")))) {
+                values[vx] = FormatSetReader.resolveValue(strVal.replaceAll("\\$|\\{|\\}", ""), globals);
+                //log.info(String.format("resolved %s => %s", strVal, values[vx].toString()));
+            }
+        }
+        //log.info("resolved: " + Arrays.toString(values));
+    }
+
     public static Object resolveValue(String genSpec, Map<String, Object> globals)
         throws Exception
     {
@@ -93,8 +123,8 @@ public class ValueGenerator implements Runnable {
     public void run() {
 
         String[] set = null;
-        int full, empty;
-        long sleepTime;
+        int count = 0, full = 0, empty = 0;
+        long start, sleepTime, workTime;
 
         running = true;
 
@@ -102,6 +132,8 @@ public class ValueGenerator implements Runnable {
         long uniqueSet = 0;
 
         while (running) {
+
+            start = System.nanoTime();
 
             full = empty = 0;
 
@@ -111,6 +143,10 @@ public class ValueGenerator implements Runnable {
 
                 SetReader in = input.get(ix);
                 ArrayBlockingQueue<String[]> out = output.get(ix);
+
+                // skip null IO definition (eg none://)
+                if (in == null || out == null)
+                    continue;
 
                 // skip if we have no room
                 if (out.remainingCapacity() <= 0) {
@@ -129,16 +165,18 @@ public class ValueGenerator implements Runnable {
                 set = in.read(unique);
 
                 // close the reader if it has reached EOF
-                if (set == null || set.length == 0) {
+                if (set == null) {
                     in.close();
                     empty++;
                     continue;
                 }
 
-                log.info("values: " + Arrays.toString(set));
+                //log.info("values: " + Arrays.toString(set));
 
                 if (set.length > 0) {
-                    if (! out.offer(set)) {
+                    if (out.offer(set)) {
+                        count++;
+                    } else {
                         log.info(String.format("Internal error: failed to add values to queue: %s", in.getName()));
                     }
                 } else {
@@ -146,18 +184,34 @@ public class ValueGenerator implements Runnable {
                 }
             }
 
-            //log.info("input.size=" + input.size() + ";  empty=" + empty + "; full=" + full);
-            sleepTime = 0;
+            workTime = System.nanoTime() - start;
 
             // if we are waiting for work to do - sleep a little
             if (empty + full >= input.size()) {
-                sleepTime = (full > 0 ? fullSleepTime : emptySleepTime);
-                log.info("No work done - sleeping for " + sleepTime);
+                //sleepTime = (full > 0 ? fullSleepTime : emptySleepTime);
+                //log.info("No work done - sleeping for " + sleepTime);
+                int queued = 0;
+                for (BlockingQueue<String[]> q : output) {
+                    queued += q.size();
+                }
 
-                try { Thread.sleep(sleepTime); }
-                catch (InterruptedException e) {}
+                log.info(String.format("Generated %d value sets. Total queued: %,d", count, queued));
 
-                sleepTime = 0;
+                start = System.nanoTime();
+
+                synchronized(semaphore) {
+                    try {
+                        semaphore.wait(1000);
+                    } catch (InterruptedException e) {}
+                }
+
+                sleepTime = System.nanoTime() - start;
+                count = 0;
+
+                double workMillis = 1.0d/Controller.Nano2Millis * workTime;
+                double sleepMillis = 1.0d/Controller.Nano2Millis * sleepTime;
+
+                log.info(String.format("Waking up... work:sleep is %f:%f %.2f%%", workMillis, sleepMillis, 100.0 * workMillis / (workMillis + sleepMillis)));
             }
         }
 
@@ -174,6 +228,8 @@ public class ValueGenerator implements Runnable {
         log.info("getReader - uri = " + uri);
 
         String type = uri.substring(0, uri.indexOf(':'));
+
+        if (type.equalsIgnoreCase("none")) return null;
 
         try {
             SetReader reader = typeMap.get(type).newInstance();
@@ -288,28 +344,34 @@ class FileSetReader implements ValueGenerator.SetReader {
 
     public String[] read(long unique) {
         try {
-            String line = reader.readLine();
-            if (line == null || line.length() == 0) return ValueGenerator.EMPTY_STRING_ARRAY;
+            while (true) {
+                String line = reader.readLine();
+                if (line == null) return null;
 
-            String[] result = parser.parse(line);
+                if (line.trim().length() == 0) continue;
 
-            // resolve any global variable references
-            for (int rx = 0; rx < result.length; rx++) {
-                String val = result[rx];
-                if (val.endsWith("}") && (val.startsWith("{") || val.startsWith("${"))) {
-                    //Object resolved = globals.get(val.replaceAll("\\$|\\{|\\}", ""));
-                    Object resolved = ValueGenerator.resolveValue(val, globals);
-                    result[rx] = (resolved != null ? resolved.toString() : "");
-                    //Logger.getLogger("readValue").info(String.format("resolved var %s -> %s", val, result[rx]));
+                String[] result = parser.parse(line);
+
+                if (result.length == 0) continue;
+
+                // resolve any global variable references
+                for (int rx = 0; rx < result.length; rx++) {
+                    String val = result[rx];
+                    if (val.endsWith("}") && (val.startsWith("{") || val.startsWith("${"))) {
+                        //Object resolved = globals.get(val.replaceAll("\\$|\\{|\\}", ""));
+                        Object resolved = ValueGenerator.resolveValue(val, globals);
+                        result[rx] = (resolved != null ? resolved.toString() : "");
+                        //Logger.getLogger("readValue").info(String.format("resolved var %s -> %s", val, result[rx]));
+                    }
                 }
-            }
 
-            return result;
+                return result;
+            }
         }
         catch (Exception e) {
             Logger.getLogger("FileFormatter.read").info("Error reading line: " + e.toString());
             e.printStackTrace();
-            return ValueGenerator.EMPTY_STRING_ARRAY;
+            return null;
         }
     }
 }
@@ -327,7 +389,7 @@ class CsvSetParser implements ValueGenerator.SetParser {
         int start = 0;
         boolean quoted = false;
 
-        ValueGenerator.log.info("CSV line=" + line);
+        //ValueGenerator.log.info("CSV line=" + line);
 
         int max = line.length()-1;
         for (int cx = 0; cx <= max; cx++) {
@@ -413,7 +475,7 @@ class FormatSetReader implements ValueGenerator.SetReader {
             value[fx] = valFmt[0];
             format[fx] = valFmt[1];
 
-            log.info("value: " + value[fx] + "; format: " + format[fx]);
+            //log.info("value: " + value[fx] + "; format: " + format[fx]);
         }
 
         open = true;
@@ -454,7 +516,7 @@ class FormatSetReader implements ValueGenerator.SetReader {
                 try {
                     genval[fx] = resolveValue(genSpec, globals);
                 } catch (Exception e) {
-                    log.info(String.format("Error generating value for %s:\n%s", genSpec, e.toString()));
+                    log.info(String.format("Error resolving value for %s\n%s", genSpec, e.toString()));
                     return ValueGenerator.EMPTY_STRING_ARRAY;
                 }
 
@@ -467,7 +529,7 @@ class FormatSetReader implements ValueGenerator.SetReader {
             result[fx] = String.format(format[fx], genval);
         }
 
-        log.info("spec: " + Arrays.toString(value) + " -> " + Arrays.toString(result));
+        //log.info("spec: " + Arrays.toString(value) + " -> " + Arrays.toString(result));
         return result;
     }
 
@@ -481,9 +543,9 @@ class FormatSetReader implements ValueGenerator.SetReader {
         Matcher match = (isVarFormat ? varGenSPec.matcher(genSpec) : fmtGenSpec.matcher(genSpec));
 
         if (match.find() && (match.group(2) != null || match.group(3) != null)) {
-            for (int gx = 1; gx <= match.groupCount(); gx++) {
-                log.info(String.format("group[%d] = %s", gx, match.group(gx)));
-            }
+            //for (int gx = 1; gx <= match.groupCount(); gx++) {
+            //    log.info(String.format("group[%d] = %s", gx, match.group(gx)));
+            //}
 
             String genType = (match.group(5) != null && match.group(5).length() > 0 ? match.group(5) : "r");
 
@@ -493,7 +555,7 @@ class FormatSetReader implements ValueGenerator.SetReader {
                 result[0] = String.format("%s:%s", genType.charAt(0), match.group(3));
 
             result[1] = String.format("%s%%%d$%s%s%s", match.group(1), index+1, match.group(4), genType, match.group(6));
-            log.info("genSpec=" + result[0] + "; format=" + result[1]);
+            //log.info("genSpec=" + result[0] + "; format=" + result[1]);
         } else {
             result[0] = "";
             result[1] = genSpec;
@@ -511,6 +573,10 @@ class FormatSetReader implements ValueGenerator.SetReader {
                 // global var reference
                 // log.info("locals=" + locals.toString());
                 Object result = globals.get(genSpec.substring(2));
+
+                // var not found => deferred resolution
+                if (result == null)
+                    return String.format("${%s}", genSpec);
 
                 switch (genSpec.charAt(0)) {
                     case 'r':

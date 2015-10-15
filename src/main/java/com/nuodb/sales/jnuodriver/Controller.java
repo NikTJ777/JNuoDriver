@@ -32,8 +32,8 @@ public class Controller implements AutoCloseable {
     boolean initDb = false;
     boolean queryOnly = false;
 
-    AtomicLong totalInserts = new AtomicLong();
-    AtomicLong totalInsertTime = new AtomicLong();
+    AtomicLong totalStatements = new AtomicLong();
+    AtomicLong totalStatementTime = new AtomicLong();
 
     AtomicLong totalRetrieved = new AtomicLong();
     AtomicLong totalRetrievedRecords = new AtomicLong();
@@ -83,6 +83,9 @@ public class Controller implements AutoCloseable {
     public static final String DB_CATCH_BLOCK =     "db.catch.block";
     public static final String DB_SCHEMA =          "db.schema";
     public static final String TX_MODEL =           "tx.model";
+    public static final String SESSION_MODEL =      "session.model";
+    public static final String SESSION_MAX_USE =    "session.max.use";
+    public static final String SESSION_MAX_TIME =   "session.max.time";
     public static final String COMMUNICATION_MODE = "communication.mode";
     public static final String BULK_COMMIT_MODE =   "bulk.commit.mode";
     public static final String SP_NAME_PREFIX=      "sp.name.prefix";
@@ -94,19 +97,20 @@ public class Controller implements AutoCloseable {
     public static final String LIST_PREFIX =        "@list";
 
     protected enum TxModel { DISCRETE, UNIFIED }
+    protected enum SessionModel { POOLED, CACHED, BATCHED }
 
     public enum TaskType { UPDATE, QUERY }
 
     static final Pattern VariableReferencePattern = Pattern.compile("\\$\\{[^\\}]+\\}");
-    static final Pattern ScriptStatementPattern = Pattern.compile("^\\{\\s*(\\S*?)\\s*\\}\\s*([\\p{Punct}\\p{Alpha}])(.*)$");
+    static final Pattern ScriptStatementPattern = Pattern.compile("^\\s*\\{\\s*(\\S*?)\\s*,?\\s*(\\p{Alpha})?\\}\\s*([\\p{Punct}\\p{Alpha}])\\s*(.*)$");
 
     private static Logger appLog = Logger.getLogger("JNuoTest");
     private static Logger insertLog = Logger.getLogger("InsertLog");
     private static Logger viewLog = Logger.getLogger("EventViewer");
 
-    private static final double Nano2Millis = 1000000.0;
-    private static final double Nano2Seconds = 1000000000.0;
-    private static final double Millis2Seconds = 1000.0;
+    static final double Nano2Millis = 1000000.0;
+    static final double Nano2Seconds = 1000000000.0;
+    static final double Millis2Seconds = 1000.0;
 
     private static final long Millis = 1000;
 
@@ -135,6 +139,9 @@ public class Controller implements AutoCloseable {
         defaultProperties.setProperty(MAX_RETRY, "3");
         defaultProperties.setProperty(RUN_TIME, "5");
         defaultProperties.setProperty(TX_MODEL, "DISCRETE");
+        defaultProperties.setProperty(SESSION_MODEL, "POOLED");
+        defaultProperties.setProperty(SESSION_MAX_USE, "100");
+        defaultProperties.setProperty(SESSION_MAX_TIME, "2000");
         defaultProperties.setProperty(COMMUNICATION_MODE, "SQL");
         defaultProperties.setProperty(BULK_COMMIT_MODE, "BATCH");
         defaultProperties.setProperty(SP_NAME_PREFIX, "importer_");
@@ -227,6 +234,10 @@ public class Controller implements AutoCloseable {
         appLog.info(String.format("SqlSession.globalCommsMode set to %s", commsMode));
 
         SqlSession.setSpNamePrefix(appProperties.getProperty(SP_NAME_PREFIX));
+
+        int maxUse = Integer.parseInt(appProperties.getProperty(SESSION_MAX_USE));
+        long maxTime = Long.parseLong(appProperties.getProperty(SESSION_MAX_TIME));
+        SqlSession.setExpiry(maxUse, maxTime);
 
         String taskPaths = appProperties.getProperty(TASK_PROPERTIES_PATHS);
         if (taskPaths == null || taskPaths.length() == 0) {
@@ -325,7 +336,7 @@ public class Controller implements AutoCloseable {
         valueGenerator.start();
 
         do {
-            totalEvents++;
+            //totalEvents++;
             appLog.info(String.format("Scheduling Task. Queue size=%d", ((ThreadPoolExecutor) taskExecutor).getQueue().size()));
 
             now = System.currentTimeMillis();
@@ -343,12 +354,14 @@ public class Controller implements AutoCloseable {
                 }
 
                 delay = task.schedule();
+                
                 if (delay < 0) {
                     task.setActive(false);
                     inactive++;
                     continue;
                 }
 
+                totalEvents++;
                 if (delay < sleepTime) sleepTime = delay;
             }
 
@@ -372,15 +385,18 @@ public class Controller implements AutoCloseable {
 
             appLog.info(String.format("Sleeping done. Queue size=%d", ((ThreadPoolExecutor) taskExecutor).getQueue().size()));
 
-            appLog.info(String.format("Processed %,d events containing %,d records in %.2f secs"
-                            + "\n\tThroughput:\t%.2f events/sec at %.2f ips;"
-                            + "\n\tSpeed:\t\t%,d inserts in %.2f secs = %.2f ips"
-                            + "\n\tQueries:\t%,d queries got %,d records in %.2f secs at %.2f qps",
-                    totalEvents, totalInserts.get(), (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalInserts.get() / wallTime),
-                    totalInserts.get(), (totalInsertTime.get() / Nano2Seconds), (Nano2Seconds * totalInserts.get() / totalInsertTime.get()),
+            appLog.info(String.format("Scheduled %,d events; Processed %,d statements in %.2f secs"
+                            + "\n\tThroughput:\t%.2f scheduled and %.2f processed/sec;"
+                            + "\n\tSpeed:\t\t%,d statements in %.2f secs = %.2f /sec"
+                            + "\n\tSecondary:\t%,d statements processed %,d rows in %.2f secs at %.2f /sec",
+                    totalEvents, totalStatements.get(), (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalStatements.get() / wallTime),
+                    totalStatements.get(), (totalStatementTime.get() / Nano2Seconds), (Nano2Seconds * totalStatements.get() / totalStatementTime.get()),
                     totalRetrieved.get(), totalRetrievedRecords.get(), (totalRetrieveTime.get() / Nano2Seconds), (Nano2Seconds * totalRetrieved.get() / totalRetrieveTime.get())));
 
-
+            // display individual metrics
+            for (TaskContext task : taskList) {
+                appLog.info(String.format("Task: %s\tSpeed: total %,d statements at %.2f sps", task.name, task.totalUpdates.get(), (Nano2Seconds * task.totalUpdates.get() / task.totalUpdateTime.get())));
+            }
         } while (System.currentTimeMillis() < endTime);
     }
 
@@ -395,19 +411,19 @@ public class Controller implements AutoCloseable {
             System.out.println("Interrupted while waiting for shutdown - exiting");
         }
 
-        appLog.info(String.format("Exiting with %d items remaining in the queue.\n\tProcessed %,d events containing %,d records in %.2f secs"
-                        + "\n\tThroughput:\t%.2f events/sec at %.2f ips;"
-                        + "\n\tSpeed:\t\t%,d inserts in %.2f secs = %.2f ips"
-                        + "\n\tQueries:\t%,d queries got %,d records in %.2f secs at %.2f qps",
+        appLog.info(String.format("Exiting with %d items remaining in the queue.\n\tScheduled %,d events; Processed %,d statements in %.2f secs"
+                        + "\n\tThroughput:\t%.2f scheduled and %.2f processed /sec;"
+                        + "\n\tSpeed:\t\t%,d statements in %.2f secs = %.2f /sec"
+                        + "\n\tSecondary:\t%,d statements processed %,d rows in %.2f secs at %.2f /sec",
                 ((ThreadPoolExecutor) taskExecutor).getQueue().size(),
-                totalEvents, totalInserts.get(), (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalInserts.get() / wallTime),
-                totalInserts.get(), (totalInsertTime.get() / Nano2Seconds), (Nano2Seconds * totalInserts.get() / totalInsertTime.get()),
+                totalEvents, totalStatements.get(), (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalStatements.get() / wallTime),
+                totalStatements.get(), (totalStatementTime.get() / Nano2Seconds), (Nano2Seconds * totalStatements.get() / totalStatementTime.get()),
                 totalRetrieved.get(), totalRetrievedRecords.get(), (totalRetrieveTime.get() / Nano2Seconds), (Nano2Seconds * totalRetrieved.get() / totalRetrieveTime.get())));
 
         //appLog.info(String.format("Exiting with %d items remaining in the queue.\n\tProcessed %,d events containing %,d records in %.2f secs\n\tThroughput:\t%.2f events/sec at %.2f ips;\n\tSpeed:\t\t%,d inserts in %.2f secs = %.2f ips",
         //        ((ThreadPoolExecutor) insertExecutor).getQueue().size(),
-        //        totalEvents, totalInserts/*.get()*/, (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalInserts/*.get()*/ / wallTime),
-        //        totalInserts/*.get()*/, (totalInsertTime/*.get()*/ / Nano2Seconds), (Nano2Seconds * totalInserts/*.get()*/ / totalInsertTime/*.get()*/)));
+        //        totalEvents, totalStatements/*.get()*/, (wallTime / Millis2Seconds), (Millis2Seconds * totalEvents / wallTime), (Millis2Seconds * totalStatements/*.get()*/ / wallTime),
+        //        totalStatements/*.get()*/, (totalStatementTime/*.get()*/ / Nano2Seconds), (Nano2Seconds * totalStatements/*.get()*/ / totalStatementTime/*.get()*/)));
 
         SqlSession.cleanup();
     }
@@ -422,7 +438,10 @@ public class Controller implements AutoCloseable {
             // run the clear scripts in reverse order
             for (TaskContext task : reverseTaskList) {
                 List<String> script = task.dbClearSQL;
-                if (script == null) appLog.info("Somehow clear script is NULL in " + task.name);
+                if (script == null) {
+                    appLog.info("Somehow clear script is NULL in " + task.name);
+                    continue;
+                }
 
                 appLog.info(String.format("running clear sql from %s (%d statements): %s", task.path, script.size(), script.toString()));
                 session.execute(script.toArray(new String[0]));
@@ -431,7 +450,10 @@ public class Controller implements AutoCloseable {
             // run the init scripts in the specified order
             for (TaskContext task : taskList) {
                 List<String> script = task.dbInitSQL;
-                if (script == null) appLog.info("Somehow init script is NULL in " + task.name);
+                if (script == null) {
+                    appLog.info("Somehow init script is NULL in " + task.name);
+                    continue;
+                }
 
                 appLog.info(String.format("running init sql from %s (%d statements): %s", task.path, script.size(), script.toString()));
                 session.execute(script.toArray(new String[0]));
@@ -512,6 +534,8 @@ public class Controller implements AutoCloseable {
         if (output.length() > 0) {
             //appLog.info(String.format("Replacing updated property %s=%s", entry.getKey(), newVar));
             match.appendTail(output);
+        } else {
+            output.append(property);
         }
     }
 
@@ -527,6 +551,7 @@ public class Controller implements AutoCloseable {
         public final int minBurst, maxBurst;
         public final int minViewDelay, maxViewDelay;
         public final TxModel txModel;
+        public final SessionModel sessionModel;
         public final SqlSession.Mode bulkCommitMode;
         public final boolean instrumentSQL;
         public final List<String> dbClearSQL;
@@ -535,7 +560,9 @@ public class Controller implements AutoCloseable {
         public final Class<Runnable> updateTaskType;
         public final Class<Runnable> queryTaskType;
         public final List<String> updateSql;
+        public final List<String> updateActions;
         public final List<String> querySql;
+        public final List<String> queryActions;
         public final String[] updateValuesURI;
         public final String[] queryValuesURI;
         public final List<ArrayBlockingQueue<String[]>> updateValues;
@@ -553,16 +580,15 @@ public class Controller implements AutoCloseable {
         AtomicLong totalQueryRecords = new AtomicLong();
         AtomicLong totalQueryTime = new AtomicLong();
 
-
         public TaskContext(String path, Properties properties)
-                throws Exception
-        {
+                throws Exception {
             this.path = path;
             this.properties = properties;
 
-            appLog.info("Task properties: " + properties);
-
             name = properties.getProperty(TASK_NAME);
+
+            appLog.info(String.format("Task %s properties: %s", name, properties));
+
             averageRate = Float.parseFloat(properties.getProperty(AVERAGE_RATE));
             minBurst = Integer.parseInt(properties.getProperty(MIN_BURST));
             maxBurst = Integer.parseInt(properties.getProperty(MAX_BURST));
@@ -574,7 +600,7 @@ public class Controller implements AutoCloseable {
             int delay = Integer.parseInt(properties.getProperty(MAX_VIEW_DELAY));
             maxViewDelay = (delay > 0 && delay < minViewDelay ? minViewDelay : delay);
 
-            burstProbability  = (minBurst < maxBurst
+            burstProbability = (minBurst < maxBurst
                     ? Float.parseFloat(properties.getProperty(BURST_PROBABILITY_PERCENT))
                     : 0);
 
@@ -583,22 +609,75 @@ public class Controller implements AutoCloseable {
             }
 
             TxModel model;
-            try { model = Enum.valueOf(TxModel.class, appProperties.getProperty(TX_MODEL)); }
-            catch (Exception e) { model = TxModel.DISCRETE; }
+            try {
+                model = Enum.valueOf(TxModel.class, properties.getProperty(TX_MODEL));
+            } catch (Exception e) {
+                model = TxModel.DISCRETE;
+            }
             txModel = model;
 
+            SessionModel smodel;
+            try {
+                smodel = Enum.valueOf(SessionModel.class, properties.getProperty(SESSION_MODEL));
+            } catch (Exception e) {
+                smodel = SessionModel.POOLED;
+            }
+            sessionModel = smodel;
+
             SqlSession.Mode mode;
-            try { mode = Enum.valueOf(SqlSession.Mode.class, appProperties.getProperty(BULK_COMMIT_MODE)); }
-            catch (Exception e) { mode = SqlSession.Mode.BATCH; }
+            try {
+                mode = Enum.valueOf(SqlSession.Mode.class, properties.getProperty(BULK_COMMIT_MODE));
+            } catch (Exception e) {
+                mode = SqlSession.Mode.BATCH;
+            }
             bulkCommitMode = mode;
 
             String typeName = properties.getProperty(UPDATE_TASK_CLASS);
             updateTaskType = (Class<Runnable>) Class.forName(typeName);
             updateSql = parseScript(properties.getProperty(DB_UPDATE_SQL));
 
+            // extract any actions from the sql
+            if (updateSql != null && updateSql.size() > 0) {
+                updateActions = new ArrayList<String>(updateSql.size());
+                for (int sx = 0; sx < updateSql.size(); sx++) {
+                    String statement = updateSql.get(sx);
+                    if (statement.charAt(0) == '{' && statement.endsWith("}")) {
+                        appLog.info("found action: " + statement);
+                        updateActions.add(statement);
+                        updateSql.remove(sx);
+                        sx--;
+                    } else {
+                        updateActions.add(" ");
+                    }
+                }
+                appLog.info("update sql now=" + updateSql.toString());
+            } else {
+                updateActions = null;
+            }
+
             typeName = properties.getProperty(QUERY_TASK_CLASS);
             queryTaskType = (Class<Runnable>) Class.forName(typeName);
             querySql = parseScript(properties.getProperty(DB_QUERY_SQL));
+
+            // extract any actions from the sql
+            if (querySql != null && querySql.size() > 0) {
+                queryActions = new ArrayList<String>(querySql.size());
+                for (int sx = 0; sx < querySql.size(); sx++) {
+                    String statement = querySql.get(sx);
+                    if (statement.charAt(0) == '{' && statement.endsWith("}")) {
+                        appLog.info("found action: " + statement);
+                        queryActions.add(statement);
+                        querySql.remove(sx);
+                        sx--;
+                    } else {
+                        queryActions.add(" ");
+                    }
+                }
+                appLog.info("query sql now=" + querySql.toString());
+            } else {
+                queryActions = null;
+            }
+
 
             updateValuesURI = properties.getProperty(DB_UPDATE_VALUES).split("\n");
             queryValuesURI = properties.getProperty(DB_QUERY_VALUES).split("\n");
@@ -607,12 +686,18 @@ public class Controller implements AutoCloseable {
 
             updateValues = new ArrayList<ArrayBlockingQueue<String[]>>(updateValuesURI.length);
             for (int ix = 0; ix < updateValuesURI.length; ix++) {
-                updateValues.add(new ArrayBlockingQueue<String[]>(10 * updateThreads));
+                if (updateValuesURI[ix].trim().startsWith("none://"))
+                    updateValues.add(null);
+                else
+                    updateValues.add(new ArrayBlockingQueue<String[]>(10 * updateThreads));
             }
 
             queryValues = new ArrayList<ArrayBlockingQueue<String[]>>(queryValuesURI.length);
             for (int ix = 0; ix < queryValuesURI.length; ix++) {
-                queryValues.add(new ArrayBlockingQueue<String[]>(10 * queryThreads));
+                if (queryValuesURI[ix].trim().startsWith("none://"))
+                    queryValues.add(null);
+                else
+                    queryValues.add(new ArrayBlockingQueue<String[]>(10 * queryThreads));
             }
 
             catchBlock = properties.getProperty(DB_CATCH_BLOCK);
@@ -637,6 +722,10 @@ public class Controller implements AutoCloseable {
         public boolean isActive()
         { return active; }
 
+        public void getMoreValues() {
+            valueGenerator.awaken();
+        }
+
         public void updateTimes(Controller.TaskType type, long time, long statements, long rows)
             throws Exception
         {
@@ -645,8 +734,8 @@ public class Controller implements AutoCloseable {
                     totalUpdates.addAndGet(statements);
                     totalUpdateTime.addAndGet(time);
 
-                    totalInserts.addAndGet(statements);
-                    totalInsertTime.addAndGet(time);
+                    totalStatements.addAndGet(statements);
+                    totalStatementTime.addAndGet(time);
                     break;
 
                 case QUERY:
@@ -669,8 +758,10 @@ public class Controller implements AutoCloseable {
         {
             long now = System.currentTimeMillis();
 
-            if (! active)
+            if (! active) {
+                appLog.info("Task inactive: " + name);
                 return -1;
+            }
 
             int first = 0;
             int last = timestamp.length-1;
@@ -689,7 +780,7 @@ public class Controller implements AutoCloseable {
             // randomly create a burst
             if (burstProbability > 0 && Percent * random.nextFloat() <= burstProbability) {
                 int burstSize = minBurst + random.nextInt(maxBurst - minBurst);
-                appLog.info(String.format("Creating burst of %d", burstSize));
+                appLog.info(String.format("Task %s: creating burst of %d", name, burstSize));
 
                 delay = 0;
 
@@ -710,11 +801,11 @@ public class Controller implements AutoCloseable {
 
                 delay = (long) (averageDelay * (currentRate / averageRate));
 
-                appLog.info(String.format("Current Rate= %.2f; scheduling for now + %,d ms", currentRate, delay));
+                appLog.info(String.format("Task %s: current Rate= %.2f; scheduling for now + %,d ms", name, currentRate, delay));
 
                 if (timingSpeedup > 1) {
                     delay /= timingSpeedup;
-                    appLog.info(String.format("Warp-drive: speedup %f; scheduling for now + %d ms", timingSpeedup, delay));
+                    appLog.info(String.format("Warp-drive: speedup %f; scheduling %s for now + %d ms", timingSpeedup, name, delay));
                 }
 
                 scheduleTasks(delay);
@@ -788,10 +879,11 @@ public class Controller implements AutoCloseable {
                 System.out.println("stmnt=" + stmnt);
 
                 // support sql in discrete files
-                if (stmnt.toLowerCase().startsWith("file://")) {
+                if (stmnt.trim().toLowerCase().startsWith("file://")) {
                     statements.remove(sx);
 
                     List<String> scriptlet = Arrays.asList(readScript(script).split(";"));
+                    appLog.info(String.format("scriptlet (%d lines)=", scriptlet.size(), scriptlet.toString()));
 
                     if (sx < statements.size()-1)
                         statements.addAll(sx, scriptlet);
@@ -808,8 +900,11 @@ public class Controller implements AutoCloseable {
                 // extract action, and store it as a statement annotation (on a preceding line)
                 Matcher match = ScriptStatementPattern.matcher(stmnt);
                 if (match.find()) {
-                    sql.add(String.format("{%s%s}", match.group(2), match.group(1)));
-                    stmnt = match.group(3);
+                    String type = match.group(2);
+                    if (type == null || type.length() == 0) type = "s";
+                    sql.add(String.format("{%s%s%s}", match.group(3), type, match.group(1)));
+                    appLog.info("action=" + sql.get(sql.size()-1));
+                    stmnt = match.group(4);
                 }
 
                 System.out.println("extracted stmnt is: " + stmnt);
@@ -944,8 +1039,12 @@ public class Controller implements AutoCloseable {
                     if (line != null && line.length() > 0) buffer.append(line).append('\n');
                 } while (line != null);
 
+                appLog.info("read file: " + buffer.toString());
+
                 // resolve any references in the script
                 resolveReferences(buffer.toString(), buffer);
+
+                appLog.info("resolved file: " + buffer.toString());
 
                 return buffer.toString();
             } catch (Exception e) {

@@ -23,7 +23,14 @@ public class SqlSession implements AutoCloseable {
 
     private Connection connection;
     private PreparedStatement batch;
+    private PreparedStatement preparedStatement;
     private List<PreparedStatement> statements;
+
+    private int useCount;
+    private long expireTime;
+
+    private static int maxUse;
+    private static long maxTime;
 
     private static Map<String, Properties> connectionProperties = new HashMap<String, Properties>(16);
     private static Map<String, DataSource> dataSources;
@@ -117,6 +124,11 @@ public class SqlSession implements AutoCloseable {
         SpNamePrefix = prefix;
     }
 
+    public static void setExpiry(int maxUseValue, long maxTimeValue) {
+        maxUse = maxUseValue;
+        maxTime = maxTimeValue;
+    }
+
     public SqlSession(Mode mode)
     { this(mode, DEFAULT_DATASOURCE); }
 
@@ -129,6 +141,9 @@ public class SqlSession implements AutoCloseable {
         if (! connectionProperties.containsKey(type)) {
             log.info(String.format("No config found for SqlSession type %s - using default session", type));
         }
+
+        useCount = 0;
+        expireTime = System.currentTimeMillis() + maxTime;
 
         // any existing session is our parent
         parent = current.get();
@@ -151,15 +166,19 @@ public class SqlSession implements AutoCloseable {
             released++;
         }
 
-        throw new PersistenceException("%d unclosed SqlSessions were cleaned up", released);
+        log.info(String.format("%d unclosed SqlSessions were cleaned up", released));
     }
 
     public static SqlSession getCurrent() {
+        return current.get();
+
+        /*
         SqlSession session = current.get();
         if (session == null)
             throw new PersistenceException("No current session");
 
         return session;
+        */
     }
 
     public void rollback() {
@@ -181,6 +200,9 @@ public class SqlSession implements AutoCloseable {
         rollback();
         releaseResources();
 
+        if (parent != null)
+            return parent.retry(e);
+
         // return true if the operation could be retried
         if (e instanceof SQLTransientException){
            return true;
@@ -192,6 +214,8 @@ public class SqlSession implements AutoCloseable {
     @Override
     public void close()
     {
+        long start = System.nanoTime();
+
         current.set(parent);
         sessions.remove(this);
 
@@ -203,6 +227,20 @@ public class SqlSession implements AutoCloseable {
         }
         finally {
             releaseResources();
+        }
+
+        //log.info(String.format("Session closed in %.2f ms", 1.0d/Controller.Nano2Millis * (System.nanoTime() - start)));
+    }
+
+    /**
+     * Put the session away.
+     * If the session has expired, release resources
+     */
+    public void park()
+    {
+        if (++useCount > maxUse || System.currentTimeMillis() > expireTime) {
+            releaseResources();
+            //log.info(String.format("Session has expired after %d uses and %,d ms", useCount, maxTime + System.currentTimeMillis() - expireTime));
         }
     }
 
@@ -216,10 +254,10 @@ public class SqlSession implements AutoCloseable {
         //if (parent != null)
           //  return parent.getStatement(sql);
 
-        if (statements == null) {
-            statements = new ArrayList<PreparedStatement>(16);
+        //if (statements == null) {
+          //  statements = new ArrayList<PreparedStatement>(16);
             //statements = new HashMap<String, PreparedStatement>(16);
-        }
+        //}
 
         //PreparedStatement ps = statements.get(sql);
 
@@ -228,8 +266,9 @@ public class SqlSession implements AutoCloseable {
             //int returnMode = (commitMode == Mode.AUTO_COMMIT ? Statement.RETURN_GENERATED_KEYS : Statement.NO_GENERATED_KEYS);
             //int returnMode = Statement.RETURN_GENERATED_KEYS;
             PreparedStatement ps = connection().prepareStatement(sql, returnMode);
-            statements.add(ps);
+            //statements.add(ps);
             //statements.put(sql, ps);
+            preparedStatement = ps;
         //} else {
         //    ps.clearParameters();
         //}
@@ -295,6 +334,8 @@ public class SqlSession implements AutoCloseable {
 
         if (connection == null) {
 
+            long start = System.nanoTime();
+
             // get the existing DataSource object
             DataSource ds = dataSources.get(type);
             if (ds == null) {
@@ -302,7 +343,7 @@ public class SqlSession implements AutoCloseable {
                 dataSources.put(type, ds);
             }
 
-            log.info(String.format("Opening connection on DataSource %s", type));
+            //log.info(String.format("Opening connection on DataSource %s", type));
 
             connection = ds.getConnection();
             switch (mode) {
@@ -321,6 +362,8 @@ public class SqlSession implements AutoCloseable {
                     connection.setAutoCommit(false);
                     connection.setTransactionIsolation(updateIsolation);
             }
+
+            //log.info(String.format("Connection opened in %.2f ms", 1.0d/Controller.Nano2Millis * (System.nanoTime() - start)));
         }
 
         assert connection != null;
@@ -332,18 +375,21 @@ public class SqlSession implements AutoCloseable {
         throws Exception
     {
         if (batch != null) {
-            long batchStart = System.currentTimeMillis();
+            //long batchStart = System.currentTimeMillis();
             batch.executeBatch();
-            long count = batch.getUpdateCount();
-            long duration = System.currentTimeMillis() - batchStart;
+            //long count = batch.getUpdateCount();
+            //long duration = System.currentTimeMillis() - batchStart;
 
-            double rate = (count > 0 && duration > 0 ? 1000.0 * count / duration : 0);
-            log.info(String.format("Batch commit complete duration=%d ms; rate=%.2f ips", duration, rate));
+            //double rate = (count > 0 && duration > 0 ? 1000.0 * count / duration : 0);
+            //log.info(String.format("Batch commit complete duration=%d ms; rate=%.2f ips", duration, rate));
         }
 
         if (connection != null) {
             if (commitMode != Mode.AUTO_COMMIT) {
+                //long start = System.nanoTime();
                 connection.commit();
+                //double duration = 1.0d/Controller.Nano2Millis * (System.nanoTime() - start);
+                //log.info(String.format("Commit complete duration=%.2f ms", duration));
             }
         }
     }
@@ -363,6 +409,12 @@ public class SqlSession implements AutoCloseable {
             }
 
             statements.clear();
+        }
+
+        if (preparedStatement != null) {
+            try {
+                preparedStatement.close();
+            } catch (Exception e) {}
         }
 
         try {
